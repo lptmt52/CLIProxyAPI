@@ -148,6 +148,88 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	}
 }
 
+func TestManagementTokenUsageRequiresManagementAuthAndReturnsSnapshot(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+
+	missingKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/token-usage", nil)
+	missingKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(missingKeyRR, missingKeyReq)
+	if missingKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/token-usage", nil)
+	authReq.Header.Set("Authorization", "Bearer test-management-key")
+	authRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(authRR, authReq)
+	if authRR.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d body=%s", authRR.Code, http.StatusOK, authRR.Body.String())
+	}
+
+	var payload struct {
+		GeneratedAt string `json:"generated_at"`
+		Enabled     bool   `json:"enabled"`
+		Providers   []any  `json:"providers"`
+		Total       struct {
+			Requests int `json:"requests"`
+			Tokens   struct {
+				TotalTokens int `json:"total_tokens"`
+			} `json:"tokens"`
+		} `json:"total"`
+	}
+	if errUnmarshal := json.Unmarshal(authRR.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v body=%s", errUnmarshal, authRR.Body.String())
+	}
+	if payload.GeneratedAt == "" {
+		t.Fatalf("generated_at is empty; body=%s", authRR.Body.String())
+	}
+	if payload.Enabled {
+		t.Fatal("enabled = true, want false from test config")
+	}
+	if payload.Providers == nil {
+		t.Fatalf("providers = nil, want array; body=%s", authRR.Body.String())
+	}
+}
+
+func TestManagementTokenUsagePageAndControlPanelEntry(t *testing.T) {
+	t.Setenv("MANAGEMENT_STATIC_PATH", "")
+
+	server := newTestServer(t)
+	staticDir := filepath.Join(filepath.Dir(server.configFilePath), "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("mkdir static dir: %v", err)
+	}
+	managementPath := filepath.Join(staticDir, "management.html")
+	if err := os.WriteFile(managementPath, []byte("<!doctype html><html><body><div id=\"root\"></div></body></html>"), 0o644); err != nil {
+		t.Fatalf("write management asset: %v", err)
+	}
+
+	pageReq := httptest.NewRequest(http.MethodGet, "/management-token-usage.html", nil)
+	pageRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(pageRR, pageReq)
+	if pageRR.Code != http.StatusOK {
+		t.Fatalf("token page status = %d, want %d body=%s", pageRR.Code, http.StatusOK, pageRR.Body.String())
+	}
+	if !strings.Contains(pageRR.Body.String(), "/v0/management/token-usage") {
+		t.Fatalf("token page missing API path; body=%s", pageRR.Body.String())
+	}
+
+	panelReq := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	panelRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(panelRR, panelReq)
+	if panelRR.Code != http.StatusOK {
+		t.Fatalf("panel status = %d, want %d body=%s", panelRR.Code, http.StatusOK, panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), "cliproxy-token-usage-entry") {
+		t.Fatalf("panel missing token usage entry script; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), "/management.html") || !strings.Contains(panelRR.Body.String(), "#/token-usage") {
+		t.Fatalf("panel missing token usage hash route; body=%s", panelRR.Body.String())
+	}
+}
+
 func TestManagementPluginsRouteRegistered(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
@@ -192,6 +274,15 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 
 	t.Run("management control panel returns 404", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("token usage page returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/management-token-usage.html", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusNotFound {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	tokenusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 type usageQueueRecord []byte
@@ -40,6 +41,15 @@ func (h *Handler) GetUsageQueue(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, records)
+}
+
+// GetTokenUsageStatistics returns non-destructive in-memory token usage aggregates.
+func (h *Handler) GetTokenUsageStatistics(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, tokenusage.Snapshot())
 }
 
 func parseUsageQueueCount(value string) (int, error) {

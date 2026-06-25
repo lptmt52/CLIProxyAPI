@@ -317,23 +317,21 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
-	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+	filter, errFilter := authFileListFilterFromRequest(c)
+	if errFilter != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errFilter.Error()})
 		return
 	}
-	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
-	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			files = append(files, entry)
-		}
+
+	files := h.listAuthFileEntries()
+	files = filterAuthFileEntries(files, filter)
+	pagedFiles, pagination := paginateAuthFileEntries(files, filter.Page, filter.PageSize)
+
+	response := gin.H{"files": pagedFiles}
+	if pagination != nil {
+		response["pagination"] = pagination
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	c.JSON(200, gin.H{"files": files})
+	c.JSON(http.StatusOK, response)
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -448,6 +446,244 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+type authFileListFilter struct {
+	Provider     string
+	Disabled     *bool
+	Unauthorized bool
+	StatusCode   int
+	Page         int
+	PageSize     int
+}
+
+func authFileListFilterFromRequest(c *gin.Context) (authFileListFilter, error) {
+	filter := authFileListFilter{
+		Provider: strings.ToLower(strings.TrimSpace(c.Query("provider"))),
+		Page:     1,
+	}
+
+	if raw := strings.TrimSpace(c.Query("disabled")); raw != "" {
+		disabled, errParse := strconv.ParseBool(raw)
+		if errParse != nil {
+			return filter, fmt.Errorf("invalid disabled")
+		}
+		filter.Disabled = &disabled
+	}
+	if raw := strings.TrimSpace(c.Query("unauthorized")); raw != "" {
+		unauthorized, errParse := strconv.ParseBool(raw)
+		if errParse != nil {
+			return filter, fmt.Errorf("invalid unauthorized")
+		}
+		filter.Unauthorized = unauthorized
+	}
+	if raw := strings.TrimSpace(c.Query("status_code")); raw != "" {
+		statusCode, errAtoi := strconv.Atoi(raw)
+		if errAtoi != nil || statusCode < 0 {
+			return filter, fmt.Errorf("invalid status_code")
+		}
+		filter.StatusCode = statusCode
+	}
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		page, errAtoi := strconv.Atoi(raw)
+		if errAtoi != nil || page <= 0 {
+			return filter, fmt.Errorf("invalid page")
+		}
+		filter.Page = page
+	}
+	pageSizeRaw := strings.TrimSpace(c.Query("page_size"))
+	if pageSizeRaw == "" {
+		pageSizeRaw = strings.TrimSpace(c.Query("per_page"))
+	}
+	if pageSizeRaw != "" {
+		pageSize, errAtoi := strconv.Atoi(pageSizeRaw)
+		if errAtoi != nil || pageSize <= 0 {
+			return filter, fmt.Errorf("invalid page_size")
+		}
+		filter.PageSize = pageSize
+	}
+	return filter, nil
+}
+
+func (h *Handler) listAuthFileEntries() []gin.H {
+	if h == nil {
+		return nil
+	}
+	if h.authManager == nil {
+		return h.listAuthFilesFromDiskEntries()
+	}
+	auths := h.authManager.List()
+	files := make([]gin.H, 0, len(auths))
+	for _, auth := range auths {
+		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			files = append(files, entry)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	return files
+}
+
+func (h *Handler) listAuthFilesFromDiskEntries() []gin.H {
+	if h == nil || h.cfg == nil {
+		return nil
+	}
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		return nil
+	}
+	files := make([]gin.H, 0)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		if info, errInfo := e.Info(); errInfo == nil {
+			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+
+			full := filepath.Join(h.cfg.AuthDir, name)
+			if data, errRead := os.ReadFile(full); errRead == nil {
+				typeValue := gjson.GetBytes(data, "type").String()
+				emailValue := gjson.GetBytes(data, "email").String()
+				fileData["type"] = typeValue
+				fileData["provider"] = typeValue
+				fileData["email"] = emailValue
+				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
+					fileData["project_id"] = projectID
+				}
+				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
+					switch pv.Type {
+					case gjson.Number:
+						fileData["priority"] = int(pv.Int())
+					case gjson.String:
+						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
+							fileData["priority"] = parsed
+						}
+					}
+				}
+				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
+					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
+						fileData["note"] = trimmed
+					}
+				}
+				if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
+					switch wv.Type {
+					case gjson.True:
+						fileData["websockets"] = true
+					case gjson.False:
+						fileData["websockets"] = false
+					case gjson.String:
+						if parsed, errParse := strconv.ParseBool(strings.TrimSpace(wv.String())); errParse == nil {
+							fileData["websockets"] = parsed
+						}
+					}
+				}
+			}
+
+			files = append(files, fileData)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	return files
+}
+
+func filterAuthFileEntries(files []gin.H, filter authFileListFilter) []gin.H {
+	if len(files) == 0 {
+		return files
+	}
+	filtered := make([]gin.H, 0, len(files))
+	for _, file := range files {
+		if !authFileEntryMatchesFilter(file, filter) {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered
+}
+
+func authFileEntryMatchesFilter(file gin.H, filter authFileListFilter) bool {
+	if len(file) == 0 {
+		return false
+	}
+	if filter.Provider != "" {
+		provider, _ := file["provider"].(string)
+		if !strings.EqualFold(strings.TrimSpace(provider), filter.Provider) {
+			fileType, _ := file["type"].(string)
+			if !strings.EqualFold(strings.TrimSpace(fileType), filter.Provider) {
+				return false
+			}
+		}
+	}
+	if filter.Disabled != nil {
+		disabled, _ := file["disabled"].(bool)
+		if disabled != *filter.Disabled {
+			return false
+		}
+	}
+	statusCode, hasStatusCode := authFileEntryStatusCode(file)
+	if filter.StatusCode > 0 && (!hasStatusCode || statusCode != filter.StatusCode) {
+		return false
+	}
+	if filter.Unauthorized && (!hasStatusCode || statusCode != http.StatusUnauthorized) {
+		return false
+	}
+	return true
+}
+
+func authFileEntryStatusCode(file gin.H) (int, bool) {
+	raw, ok := file["last_error_status_code"]
+	if !ok || raw == nil {
+		return 0, false
+	}
+	switch typed := raw.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	}
+	return 0, false
+}
+
+func paginateAuthFileEntries(files []gin.H, page, pageSize int) ([]gin.H, gin.H) {
+	total := len(files)
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		return files, nil
+	}
+
+	start := (page - 1) * pageSize
+	if start >= total {
+		return []gin.H{}, gin.H{
+			"page":      page,
+			"page_size": pageSize,
+			"total":     total,
+		}
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return files[start:end], gin.H{
+		"page":      page,
+		"page_size": pageSize,
+		"total":     total,
+	}
+}
+
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if auth == nil {
 		return nil
@@ -483,6 +719,17 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	if auth.LastError != nil {
+		entry["last_error"] = gin.H{
+			"code":        auth.LastError.Code,
+			"message":     auth.LastError.Message,
+			"retryable":   auth.LastError.Retryable,
+			"http_status": auth.LastError.HTTPStatus,
+		}
+		if auth.LastError.HTTPStatus > 0 {
+			entry["last_error_status_code"] = auth.LastError.HTTPStatus
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -859,7 +1106,15 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	if len(names) == 0 {
-		c.JSON(400, gin.H{"error": "invalid name"})
+		filter, errFilter := authFileMutationFilterFromRequest(c)
+		if errFilter != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errFilter.Error()})
+			return
+		}
+		names = h.listAuthFileNamesByFilter(filter)
+	}
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid name"})
 		return
 	}
 	if len(names) == 1 {
@@ -975,14 +1230,18 @@ func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read body")
 	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
 		return nil, nil
 	}
 
 	var objectBody struct {
-		Name  string   `json:"name"`
-		Names []string `json:"names"`
+		Name         string   `json:"name"`
+		Names        []string `json:"names"`
+		Provider     string   `json:"provider"`
+		StatusCode   *int     `json:"status_code"`
+		Unauthorized *bool    `json:"unauthorized"`
 	}
 	if body[0] == '[' {
 		var arrayBody []string
@@ -1001,6 +1260,58 @@ func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
 	}
 	out = append(out, objectBody.Names...)
 	return uniqueAuthFileNames(out), nil
+}
+
+func authFileMutationFilterFromRequest(c *gin.Context) (authFileMutationFilter, error) {
+	filter := authFileMutationFilter{
+		Provider: strings.ToLower(strings.TrimSpace(c.Query("provider"))),
+	}
+	if raw := strings.TrimSpace(c.Query("status_code")); raw != "" {
+		statusCode, errAtoi := strconv.Atoi(raw)
+		if errAtoi != nil || statusCode < 0 {
+			return filter, fmt.Errorf("invalid status_code")
+		}
+		filter.StatusCode = statusCode
+	}
+	if raw := strings.TrimSpace(c.Query("unauthorized")); raw != "" {
+		unauthorized, errParse := strconv.ParseBool(raw)
+		if errParse != nil {
+			return filter, fmt.Errorf("invalid unauthorized")
+		}
+		filter.Unauthorized = &unauthorized
+	}
+
+	if c.Request == nil || c.Request.Body == nil {
+		return filter, nil
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return filter, fmt.Errorf("failed to read body")
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || body[0] == '[' {
+		return filter, nil
+	}
+
+	var objectBody struct {
+		Provider     string `json:"provider"`
+		StatusCode   *int   `json:"status_code"`
+		Unauthorized *bool  `json:"unauthorized"`
+	}
+	if err := json.Unmarshal(body, &objectBody); err != nil {
+		return filter, nil
+	}
+	if provider := strings.ToLower(strings.TrimSpace(objectBody.Provider)); provider != "" {
+		filter.Provider = provider
+	}
+	if objectBody.StatusCode != nil {
+		filter.StatusCode = *objectBody.StatusCode
+	}
+	if objectBody.Unauthorized != nil {
+		filter.Unauthorized = objectBody.Unauthorized
+	}
+	return filter, nil
 }
 
 func uniqueAuthFileNames(names []string) []string {
@@ -1214,62 +1525,118 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string `json:"name"`
-		Disabled *bool  `json:"disabled"`
+		Name         string   `json:"name"`
+		Names        []string `json:"names"`
+		Provider     string   `json:"provider"`
+		StatusCode   *int     `json:"status_code"`
+		Unauthorized *bool    `json:"unauthorized"`
+		Disabled     *bool    `json:"disabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
-	}
 	if req.Disabled == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
 		return
 	}
 
 	ctx := c.Request.Context()
-
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
+	names := uniqueAuthFileNames(append([]string{req.Name}, req.Names...))
+	if len(names) == 0 {
+		filter := authFileMutationFilter{
+			Provider: strings.ToLower(strings.TrimSpace(req.Provider)),
 		}
+		if req.StatusCode != nil {
+			filter.StatusCode = *req.StatusCode
+		}
+		if req.Unauthorized != nil {
+			filter.Unauthorized = req.Unauthorized
+		}
+		names = h.listAuthFileNamesByFilter(filter)
 	}
-
-	if targetAuth == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name, names, or filter is required"})
 		return
 	}
 
-	// Update disabled state
-	targetAuth.Disabled = *req.Disabled
-	if *req.Disabled {
-		targetAuth.Status = coreauth.StatusDisabled
-		targetAuth.StatusMessage = "disabled via management API"
-	} else {
-		targetAuth.Status = coreauth.StatusActive
-		targetAuth.StatusMessage = ""
-	}
-	targetAuth.UpdatedAt = time.Now()
+	updatedFiles := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		targetAuth := h.findAuthForDelete(name)
+		if targetAuth == nil {
+			failed = append(failed, gin.H{"name": name, "error": "auth file not found"})
+			continue
+		}
+		targetAuth.Disabled = *req.Disabled
+		if *req.Disabled {
+			targetAuth.Status = coreauth.StatusDisabled
+			targetAuth.StatusMessage = "disabled via management API"
+		} else {
+			targetAuth.Status = coreauth.StatusActive
+			targetAuth.StatusMessage = ""
+		}
+		targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+			failed = append(failed, gin.H{"name": name, "error": fmt.Sprintf("failed to update auth: %v", err)})
+			continue
+		}
+		updatedFiles = append(updatedFiles, strings.TrimSpace(targetAuth.FileName))
+	}
+	if len(updatedFiles) == 0 && len(failed) > 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "failed": failed})
+		return
+	}
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":   "partial",
+			"disabled": *req.Disabled,
+			"updated":  len(updatedFiles),
+			"files":    updatedFiles,
+			"failed":   failed,
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"disabled": *req.Disabled,
+		"updated":  len(updatedFiles),
+		"files":    updatedFiles,
+	})
+}
+
+type authFileMutationFilter struct {
+	Provider     string
+	StatusCode   int
+	Unauthorized *bool
+}
+
+func (h *Handler) listAuthFileNamesByFilter(filter authFileMutationFilter) []string {
+	if h == nil {
+		return nil
+	}
+	files := h.listAuthFileEntries()
+	listFilter := authFileListFilter{
+		Provider:   filter.Provider,
+		StatusCode: filter.StatusCode,
+	}
+	if filter.Unauthorized != nil {
+		listFilter.Unauthorized = *filter.Unauthorized
+	}
+	files = filterAuthFileEntries(files, listFilter)
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		name, _ := file["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return uniqueAuthFileNames(names)
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.

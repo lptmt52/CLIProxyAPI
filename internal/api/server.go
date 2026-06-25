@@ -353,6 +353,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
+	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetEnabled(hasManagementSecret || (cfg != nil && cfg.Home.Enabled))
 	if hasManagementSecret {
 		s.registerManagementRoutes()
@@ -381,7 +382,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" || path == "/management-token-usage.html" {
 				c.Next()
 				return
 			}
@@ -410,6 +411,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management-token-usage.html", s.serveManagementTokenUsagePage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -644,6 +646,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
+		mgmt.GET("/token-usage", s.mgmt.GetTokenUsageStatistics)
+		mgmt.GET("/usage-statistics", s.mgmt.GetTokenUsageStatistics)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -863,7 +867,16 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	data, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		log.WithError(errRead).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", injectManagementTokenUsageEntry(data))
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

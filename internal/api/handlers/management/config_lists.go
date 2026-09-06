@@ -141,6 +141,7 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	preserveGeminiKeyLabels(h.cfg.GeminiKey, arr)
 	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
 	h.cfg.SanitizeGeminiKeys()
 	h.persistLocked(c)
@@ -148,11 +149,14 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
 		APIKey         *string            `json:"api-key"`
+		Label          *string            `json:"label"`
+		Priority       *int               `json:"priority"`
 		Prefix         *string            `json:"prefix"`
 		BaseURL        *string            `json:"base-url"`
 		ProxyURL       *string            `json:"proxy-url"`
 		Headers        *map[string]string `json:"headers"`
 		ExcludedModels *[]string          `json:"excluded-models"`
+		Disabled       *bool              `json:"disabled"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -187,6 +191,12 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 
 	entry := h.cfg.GeminiKey[targetIndex]
+	if body.Value.Label != nil {
+		entry.Label = strings.TrimSpace(*body.Value.Label)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
@@ -211,6 +221,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
@@ -301,6 +314,7 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	preserveClaudeKeyLabels(h.cfg.ClaudeKey, arr)
 	h.cfg.ClaudeKey = arr
 	h.cfg.SanitizeClaudeKeys()
 	h.persistLocked(c)
@@ -308,6 +322,8 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
 		APIKey         *string               `json:"api-key"`
+		Label          *string               `json:"label"`
+		Priority       *int                  `json:"priority"`
 		Prefix         *string               `json:"prefix"`
 		BaseURL        *string               `json:"base-url"`
 		ProxyURL       *string               `json:"proxy-url"`
@@ -346,6 +362,12 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 
 	entry := h.cfg.ClaudeKey[targetIndex]
+	if body.Value.Label != nil {
+		entry.Label = strings.TrimSpace(*body.Value.Label)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -456,6 +478,7 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	preserveOpenAICompatibilityLabels(h.cfg.OpenAICompatibility, filtered)
 	h.cfg.OpenAICompatibility = filtered
 	h.cfg.SanitizeOpenAICompatibility()
 	h.persistLocked(c)
@@ -463,6 +486,8 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
 		Name          *string                             `json:"name"`
+		Label         *string                             `json:"label"`
+		Priority      *int                                `json:"priority"`
 		Prefix        *string                             `json:"prefix"`
 		Disabled      *bool                               `json:"disabled"`
 		BaseURL       *string                             `json:"base-url"`
@@ -501,6 +526,12 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 
 	entry := h.cfg.OpenAICompatibility[targetIndex]
+	if body.Value.Label != nil {
+		entry.Label = strings.TrimSpace(*body.Value.Label)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}
@@ -593,6 +624,7 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	preserveVertexCompatKeyLabels(h.cfg.VertexCompatAPIKey, arr)
 	h.cfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
 	h.cfg.SanitizeVertexCompatKeys()
 	h.persistLocked(c)
@@ -600,6 +632,8 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
 		APIKey         *string                     `json:"api-key"`
+		Label          *string                     `json:"label"`
+		Priority       *int                        `json:"priority"`
 		Prefix         *string                     `json:"prefix"`
 		BaseURL        *string                     `json:"base-url"`
 		ProxyURL       *string                     `json:"proxy-url"`
@@ -640,6 +674,12 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	}
 
 	entry := h.cfg.VertexCompatAPIKey[targetIndex]
+	if body.Value.Label != nil {
+		entry.Label = strings.TrimSpace(*body.Value.Label)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
 	if body.Value.APIKey != nil {
 		trimmed := strings.TrimSpace(*body.Value.APIKey)
 		if trimmed == "" {
@@ -949,6 +989,7 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	preserveCodexKeyLabels(h.cfg.CodexKey, filtered)
 	h.cfg.CodexKey = filtered
 	h.cfg.SanitizeCodexKeys()
 	h.persistLocked(c)
@@ -956,6 +997,8 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
 		APIKey         *string              `json:"api-key"`
+		Label          *string              `json:"label"`
+		Priority       *int                 `json:"priority"`
 		Prefix         *string              `json:"prefix"`
 		BaseURL        *string              `json:"base-url"`
 		ProxyURL       *string              `json:"proxy-url"`
@@ -994,6 +1037,12 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 
 	entry := h.cfg.CodexKey[targetIndex]
+	if body.Value.Label != nil {
+		entry.Label = strings.TrimSpace(*body.Value.Label)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
 	}
@@ -1081,11 +1130,89 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
 }
 
+func preserveProviderLabels[T any](existing, incoming []T, getLabel func(T) string, setLabel func(*T, string), identity func(T) string) {
+	labelsByIdentity := make(map[string]string, len(existing))
+	for i := range existing {
+		label := strings.TrimSpace(getLabel(existing[i]))
+		identityKey := identity(existing[i])
+		if label != "" && identityKey != "" {
+			labelsByIdentity[identityKey] = label
+		}
+	}
+
+	sameLength := len(existing) == len(incoming)
+	for i := range incoming {
+		if strings.TrimSpace(getLabel(incoming[i])) != "" {
+			continue
+		}
+		if label := labelsByIdentity[identity(incoming[i])]; label != "" {
+			setLabel(&incoming[i], label)
+			continue
+		}
+		if sameLength {
+			if label := strings.TrimSpace(getLabel(existing[i])); label != "" {
+				setLabel(&incoming[i], label)
+			}
+		}
+	}
+}
+
+func preserveGeminiKeyLabels(existing, incoming []config.GeminiKey) {
+	preserveProviderLabels(existing, incoming,
+		func(entry config.GeminiKey) string { return entry.Label },
+		func(entry *config.GeminiKey, label string) { entry.Label = label },
+		func(entry config.GeminiKey) string {
+			return strings.TrimSpace(entry.APIKey) + "\x00" + strings.TrimSpace(entry.BaseURL)
+		},
+	)
+}
+
+func preserveClaudeKeyLabels(existing, incoming []config.ClaudeKey) {
+	preserveProviderLabels(existing, incoming,
+		func(entry config.ClaudeKey) string { return entry.Label },
+		func(entry *config.ClaudeKey, label string) { entry.Label = label },
+		func(entry config.ClaudeKey) string {
+			return strings.TrimSpace(entry.APIKey) + "\x00" + strings.TrimSpace(entry.BaseURL)
+		},
+	)
+}
+
+func preserveCodexKeyLabels(existing, incoming []config.CodexKey) {
+	preserveProviderLabels(existing, incoming,
+		func(entry config.CodexKey) string { return entry.Label },
+		func(entry *config.CodexKey, label string) { entry.Label = label },
+		func(entry config.CodexKey) string {
+			return strings.TrimSpace(entry.APIKey) + "\x00" + strings.TrimSpace(entry.BaseURL)
+		},
+	)
+}
+
+func preserveVertexCompatKeyLabels(existing, incoming []config.VertexCompatKey) {
+	preserveProviderLabels(existing, incoming,
+		func(entry config.VertexCompatKey) string { return entry.Label },
+		func(entry *config.VertexCompatKey, label string) { entry.Label = label },
+		func(entry config.VertexCompatKey) string {
+			return strings.TrimSpace(entry.APIKey) + "\x00" + strings.TrimSpace(entry.BaseURL)
+		},
+	)
+}
+
+func preserveOpenAICompatibilityLabels(existing, incoming []config.OpenAICompatibility) {
+	preserveProviderLabels(existing, incoming,
+		func(entry config.OpenAICompatibility) string { return entry.Label },
+		func(entry *config.OpenAICompatibility, label string) { entry.Label = label },
+		func(entry config.OpenAICompatibility) string {
+			return strings.ToLower(strings.TrimSpace(entry.Name)) + "\x00" + strings.ToLower(strings.TrimSpace(entry.BaseURL))
+		},
+	)
+}
+
 func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	if entry == nil {
 		return
 	}
 	// Trim base-url; empty base-url indicates provider should be removed by sanitization
+	entry.Label = strings.TrimSpace(entry.Label)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	existing := make(map[string]struct{}, len(entry.APIKeyEntries))
@@ -1119,6 +1246,7 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 		return
 	}
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
+	entry.Label = strings.TrimSpace(entry.Label)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
@@ -1144,6 +1272,7 @@ func normalizeCodexKey(entry *config.CodexKey) {
 		return
 	}
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
+	entry.Label = strings.TrimSpace(entry.Label)
 	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
@@ -1170,6 +1299,7 @@ func normalizeVertexCompatKey(entry *config.VertexCompatKey) {
 		return
 	}
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
+	entry.Label = strings.TrimSpace(entry.Label)
 	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)

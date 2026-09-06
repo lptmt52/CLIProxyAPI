@@ -55,20 +55,38 @@ func SanitizeFunctionName(name string) string {
 }
 
 // SetLogLevel configures the logrus log level based on the configuration.
-// It sets the log level to DebugLevel if debug mode is enabled, otherwise to InfoLevel.
 func SetLogLevel(cfg *config.Config) {
 	currentLevel := log.GetLevel()
-	var newLevel log.Level
-	if cfg.Debug {
-		newLevel = log.DebugLevel
-	} else {
-		newLevel = log.InfoLevel
-	}
+	newLevel := ConfiguredLogLevel(cfg)
 
 	if currentLevel != newLevel {
 		log.SetLevel(newLevel)
-		log.Infof("log level changed from %s to %s (debug=%t)", currentLevel, newLevel, cfg.Debug)
+		log.Infof("log level changed from %s to %s (debug=%t, log-level=%q)", currentLevel, newLevel, cfg != nil && cfg.Debug, configuredLogLevelValue(cfg))
 	}
+}
+
+// ConfiguredLogLevel resolves the effective logrus level while preserving the
+// legacy debug boolean behavior when log-level is omitted.
+func ConfiguredLogLevel(cfg *config.Config) log.Level {
+	if cfg != nil {
+		if configured := strings.ToLower(strings.TrimSpace(cfg.LogLevel)); configured != "" {
+			if level, errParse := log.ParseLevel(configured); errParse == nil {
+				return level
+			}
+			log.Warnf("invalid log-level %q; falling back to the legacy debug flag", cfg.LogLevel)
+		}
+		if cfg.Debug {
+			return log.DebugLevel
+		}
+	}
+	return log.InfoLevel
+}
+
+func configuredLogLevelValue(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.LogLevel)
 }
 
 // ResolveAuthDir normalizes the auth directory path for consistent reuse throughout the app.

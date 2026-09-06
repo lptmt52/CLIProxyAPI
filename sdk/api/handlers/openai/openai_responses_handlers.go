@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -370,9 +371,12 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
+	log.Infof("[请求入口] Codex /responses 接口收到请求 | 客户端IP=%s | 路径=%s", c.ClientIP(), c.Request.URL.Path)
+
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
+		log.Warnf("[请求入口] 读取请求体失败: %v", err)
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
@@ -382,11 +386,16 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	// Check if the client requested a streaming response.
+	modelName := gjson.GetBytes(rawJSON, "model").String()
 	streamResult := gjson.GetBytes(rawJSON, "stream")
+	log.Infof("[请求入口] 请求模型=%s | 请求体大小=%d字节 | 客户端stream=%v (type=%s)", modelName, len(rawJSON), streamResult.Bool(), streamResult.Type.String())
+
+	// Check if the client requested a streaming response.
 	if streamResult.Type == gjson.True {
+		log.Infof("[请求入口] 流式模式 → 进入流式处理")
 		h.handleStreamingResponse(c, rawJSON)
 	} else {
+		log.Infof("[请求入口] 非流式模式 → 进入非流式处理")
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
 

@@ -12,6 +12,12 @@ logs/*
 conv/*
 temp/*
 refs/*
+
+# Local usage database
+usage.db
+usage.db-shm
+usage.db-wal
+
 plugins/*
 examples/plugin/bin/*
 

@@ -169,6 +169,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		requestBody = strings.NewReader(body.Data)
 	}
 
+	// 用log输出日志
+	log.Debug(fmt.Sprintf("method %s Request: %s Headers: %v Body: %s ", method, urlStr, reqHeaders, body.Data))
+
 	req, errNewRequest := http.NewRequestWithContext(c.Request.Context(), method, urlStr, requestBody)
 	if errNewRequest != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to build request"})

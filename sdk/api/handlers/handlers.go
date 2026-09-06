@@ -23,6 +23,7 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
@@ -688,13 +689,18 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 }
 
 func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	log.Infof("[Handler分发] 开始处理流式请求 | handlerType=%s | 原始模型名=%s | alt=%s", handlerType, modelName, alt)
+
 	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
 	if errMsg != nil {
+		log.Warnf("[Handler分发] 模型解析失败: modelName=%s | err=%v", modelName, errMsg.Error)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
+	log.Infof("[Handler分发] 模型解析成功 | 规范化模型=%s | 匹配提供商=%v", normalizedModel, providers)
+
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
@@ -715,6 +721,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
+	log.Infof("[Handler分发] 调用AuthManager.ExecuteStream | 提供商=%v | 模型=%s | 源格式=%s", providers, normalizedModel, opts.SourceFormat.String())
+
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
@@ -910,9 +918,12 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 }
 
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	// log.Infof("[模型解析] 开始解析模型名=%s | allowImageModel=%v", modelName, allowImageModel)
+
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
+		log.Infof("[模型解析] 检测到 'auto' 模型, 自动解析中...")
 		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 			resolvedModelName = modelName
 		} else {
@@ -923,6 +934,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 				resolvedModelName = resolvedBase
 			}
 		}
+		log.Infof("[模型解析] auto模型解析结果=%s", resolvedModelName)
 	} else {
 		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 			resolvedModelName = modelName
@@ -933,6 +945,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
+	// log.Infof("[模型解析] 提取基础模型名=%s (原始=%s → 规范化=%s)", baseModel, modelName, resolvedModelName)
 
 	if strings.EqualFold(routeModelBaseName(baseModel), "gpt-image-2") && !allowImageModel {
 		return nil, "", &interfaces.ErrorMessage{
@@ -942,10 +955,14 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		log.Infof("[模型解析] Home模式启用, 直接返回 providers=[home]")
 		return []string{"home"}, resolvedModelName, nil
 	}
 
 	providers = util.GetProviderName(baseModel)
+
+	// log.Infof("[模型解析] 注册表查询结果 | 基础模型=%s → providers=%v", baseModel, providers)
+
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
 	// try using the full model name. This handles edge cases where custom models
 	// may be registered with their full suffixed name (e.g., "my-model(8192)").
@@ -953,9 +970,11 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// custom model registrations that include thinking suffixes.
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
+		log.Infof("[模型解析] 回退查询 | 完整模型名=%s → providers=%v", resolvedModelName, providers)
 	}
 
 	if len(providers) == 0 {
+		log.Warnf("[模型解析] 未找到匹配的提供商 | model=%s | baseModel=%s", modelName, baseModel)
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 

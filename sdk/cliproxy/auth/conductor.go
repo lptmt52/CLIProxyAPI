@@ -1376,23 +1376,30 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
+	log.Infof("[调度器]: 调度器收到一个流式 AI 请求 | 模型=%s | 提供商=%v | 源格式=%s | maxWait=%s | maxRetryCredentials=%d", req.Model, normalized, opts.SourceFormat.String(), maxWait, maxRetryCredentials)
+
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
+			log.Infof("[调度器]: 第%d次请求执行成功", attempt+1)
 			return result, nil
 		}
 		lastErr = errStream
+		log.Warnf("[调度器]: 第%d次请求执行失败 | 错误=%v", attempt+1, errStream)
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, req.Model, maxWait)
 		if !shouldRetry {
+			log.Warnf("[调度器]: 停止重试 | 尝试次数=%d | 错误=%v", attempt+1, lastErr)
 			break
 		}
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return nil, errWait
 		}
+		log.Infof("[调度器]: 冷却结束，准备重试 | 等待时间=%v", wait)
 	}
 	if lastErr != nil {
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+			log.Infof("scheduler entry: trying Antigravity credits fallback")
 			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
 				return result, nil
 			}
@@ -1609,14 +1616,20 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	log.Infof("[调度器][遍历执行]: 开始执行 | 模型=%s | 渠道=%v | 最大凭证重试=%d", routeModel, providers, maxRetryCredentials)
+
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	credentialAttempt := 0
+
 	for {
+		credentialAttempt++
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+			log.Warnf("[调度器][遍历执行][credentialAttempt=%d]: 已达到最大凭证重试次数 | 已尝试=%d/%d", credentialAttempt, len(attempted), maxRetryCredentials)
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -1626,14 +1639,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		log.Infof("[调度器][遍历执行][credentialAttempt=%d]: 开始选择可用凭证 | 第%d次尝试 | 已跳过=%d个凭证", credentialAttempt, len(tried), credentialAttempt-1)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			log.Warnf("[调度器]: 无可用凭证 | 模型=%s | 渠道=%v | 错误=%v", routeModel, providers, errPick)
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}
 			return nil, errPick
 		}
 
+		log.Infof("[调度器]: 已选择凭证 | 凭证ID=%s | 渠道=%s | 标签=%s | 执行器=%s", auth.ID, provider, auth.Label, executor.Identifier())
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
@@ -1646,12 +1662,20 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			log.Warnf("[调度器]: 模型匹配失败，切换凭证 | 凭证ID=%s | 目标模型=%s", auth.ID, routeModel)
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			log.Warnf(
+				"[调度器]: 凭证初始化失败 | 凭证ID=%s | 渠道=%s | 执行器=%s | 错误=%v",
+				auth.ID,
+				provider,
+				executor.Identifier(),
+				errPrepare,
+			)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
@@ -1660,9 +1684,22 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errPrepare
 			continue
 		}
+		log.Infof(
+			"[调度器]: 开始调用模型执行器 | 模型=%s | 执行器=%s | 凭证ID=%s",
+			routeModel,
+			executor.Identifier(),
+			auth.ID,
+		)
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
+			log.Warnf(
+				"[调度器]: 模型请求失败 | 模型=%s | 执行器=%s | 凭证ID=%s | 错误=%v",
+				routeModel,
+				executor.Identifier(),
+				auth.ID,
+				errStream,
+			)
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -1675,6 +1712,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
+		log.Infof(
+			"[调度器]: 请求执行成功 | 模型=%s | 执行器=%s | 凭证ID=%s | 渠道=%s",
+			routeModel,
+			executor.Identifier(),
+			auth.ID,
+			provider,
+		)
 		return streamResult, nil
 	}
 }
@@ -2333,6 +2377,11 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	if isRequestInvalidError(err) {
+		return 0, false
+	}
+	// Single-credential scenario: there is no alternate credential to fail over to,
+	// so waiting for cooldown only delays an inevitable failure. Skip the wait.
+	if m.scheduler != nil && m.scheduler.readyCountForProviders(providers, model) <= 1 {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
@@ -3391,10 +3440,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
+		log.Infof("[调度器][凭证]: HomeEnabled")
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
 	if !m.useSchedulerFastPath() {
+		log.Infof("[调度器][凭证]: !useSchedulerFastPath")
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
@@ -3415,14 +3466,17 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		eligibleProviders = append(eligibleProviders, providerKey)
 	}
 	if len(eligibleProviders) == 0 {
+		log.Infof("[调度器][凭证]: no eligible provider | providers=%v", providers)
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+
 	if strings.TrimSpace(model) != "" {
 		providerSet := make(map[string]struct{}, len(eligibleProviders))
 		for _, providerKey := range eligibleProviders {
 			providerSet[providerKey] = struct{}{}
 		}
 		m.mu.RLock()
+		matchCount := 0
 		for _, candidate := range m.auths {
 			if candidate == nil || candidate.Disabled {
 				continue
@@ -3433,28 +3487,34 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
+			matchCount++
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
 				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 			}
 		}
 		m.mu.RUnlock()
+		log.Infof("[调度器][凭证]: 凭证 scan | matches=%d | providers=%v | total_auths=%d", matchCount, eligibleProviders, len(m.auths))
 	}
 
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 	for {
 		selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
+			log.Warnf("auth selection: scheduler pick failed, syncing and retrying: %v", errPick)
 			m.syncScheduler()
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		}
 		if errPick != nil {
+			log.Warnf("auth selection: scheduler pick failed: %v", errPick)
 			return nil, nil, "", errPick
 		}
 		if selected == nil {
+			log.Warnf("auth selection: scheduler returned no credential")
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
+			log.Infof("auth selection: skipping free Codex credential | auth_id=%s", selected.ID)
 			if tried == nil {
 				tried = make(map[string]struct{})
 			}
@@ -3463,8 +3523,14 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		executor, okExecutor := m.Executor(providerKey)
 		if !okExecutor {
+			log.Warnf("auth selection: executor not found | provider=%s", providerKey)
 			return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		baseURL := ""
+		if selected.Attributes != nil {
+			baseURL = strings.TrimSpace(selected.Attributes["base_url"])
+		}
+		log.Infof("[调度器][凭证][选择后返回]: auth_id=%s | baseURL=%s | provider=%s | executor=%s | label=%s", selected.ID, baseURL, providerKey, executor.Identifier(), selected.Label)
 		authCopy := selected.Clone()
 		if !selected.indexAssigned {
 			m.mu.Lock()
@@ -4487,10 +4553,11 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
+	if entry == nil || auth == nil {
 		return
 	}
-	if entry == nil || auth == nil {
+	logProviderServiceAddress(entry, auth, provider, model)
+	if !log.IsLevelEnabled(log.DebugLevel) {
 		return
 	}
 	accountType, accountInfo := auth.AccountInfo()
@@ -4506,6 +4573,46 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 		ident := formatOauthIdentity(auth, provider, accountInfo)
 		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
+}
+
+func logProviderServiceAddress(entry *log.Entry, auth *Auth, provider string, model string) {
+	serviceAddress := providerServiceAddress(auth)
+	if serviceAddress == "" {
+		return
+	}
+	providerName := strings.TrimSpace(provider)
+	if providerName == "" {
+		providerName = strings.TrimSpace(auth.Provider)
+	}
+	entry.WithFields(log.Fields{
+		"auth_id":         auth.ID,
+		"model":           model,
+		"provider":        providerName,
+		"service_address": serviceAddress,
+	}).Info("Use provider service address")
+}
+
+func providerServiceAddress(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if len(auth.Attributes) > 0 {
+		for _, key := range []string{"base_url", "base-url", "baseURL"} {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return value
+			}
+		}
+	}
+	if len(auth.Metadata) > 0 {
+		for _, key := range []string{"base_url", "base-url", "baseURL"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				if value = strings.TrimSpace(value); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {

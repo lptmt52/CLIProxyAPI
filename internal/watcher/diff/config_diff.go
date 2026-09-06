@@ -27,6 +27,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Debug != newCfg.Debug {
 		changes = append(changes, fmt.Sprintf("debug: %t -> %t", oldCfg.Debug, newCfg.Debug))
 	}
+	if strings.TrimSpace(oldCfg.LogLevel) != strings.TrimSpace(newCfg.LogLevel) {
+		changes = append(changes, fmt.Sprintf("log-level: %s -> %s", strings.TrimSpace(oldCfg.LogLevel), strings.TrimSpace(newCfg.LogLevel)))
+	}
 	if oldCfg.Pprof.Enable != newCfg.Pprof.Enable {
 		changes = append(changes, fmt.Sprintf("pprof.enable: %t -> %t", oldCfg.Pprof.Enable, newCfg.Pprof.Enable))
 	}

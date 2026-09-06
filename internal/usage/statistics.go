@@ -115,8 +115,11 @@ func newTokenUsageAggregator(now func() time.Time) *tokenUsageAggregator {
 	}
 }
 
-// Snapshot returns the current in-memory token usage statistics.
+// Snapshot returns persisted token usage statistics when available, with an in-memory fallback.
 func Snapshot() StatisticsSnapshot {
+	if snapshot, ok := snapshotFromSQLite(); ok {
+		return snapshot
+	}
 	return defaultTokenUsageStats.Snapshot()
 }
 
@@ -144,9 +147,18 @@ func (a *tokenUsageAggregator) HandleUsage(ctx context.Context, record coreusage
 	week := weekRange(timestamp)
 	month := monthRange(timestamp)
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	event := usageEvent{
+		provider: provider,
+		total:    counter,
+		dayKey:   day.key,
+		weekKey:  week.key,
+		monthKey: month.key,
+	}
+	if store := currentSQLiteStore(); store != nil {
+		store.enqueue(event)
+	}
 
+	a.mu.Lock()
 	state := a.providers[provider]
 	if state == nil {
 		state = &providerCounters{
@@ -164,6 +176,7 @@ func (a *tokenUsageAggregator) HandleUsage(ctx context.Context, record coreusage
 	pruneCounterMap(state.days, maxDayBuckets)
 	pruneCounterMap(state.weeks, maxWeekBuckets)
 	pruneCounterMap(state.months, maxMonthBuckets)
+	a.mu.Unlock()
 }
 
 func (a *tokenUsageAggregator) Snapshot() StatisticsSnapshot {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 // schedulerStrategy identifies which built-in routing semantics the scheduler should apply.
@@ -256,6 +258,23 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	if len(shard.entries) == 0 {
+		// Collect supported model info for diagnostics
+		var supportedAuthIDs []string
+		var unsupportedAuthIDs []string
+		for _, meta := range providerState.auths {
+			if meta == nil || meta.auth == nil {
+				continue
+			}
+			if meta.supportsModel(modelKey) {
+				supportedAuthIDs = append(supportedAuthIDs, meta.auth.ID)
+			} else {
+				unsupportedAuthIDs = append(unsupportedAuthIDs, fmt.Sprintf("%s(models=%v)", meta.auth.ID, mapKeys(meta.supportedModelSet)))
+			}
+		}
+		log.Warnf("[调度器-诊断] 模型shard为空 | provider=%s | modelKey=%s | 总auth数=%d | 支持模型的auth=%v | 不支持的auth=%v",
+			providerKey, modelKey, len(providerState.auths), supportedAuthIDs, unsupportedAuthIDs)
+	}
 	predicate := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
@@ -273,6 +292,17 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		return picked, nil
 	}
+	// Diagnostic: show why pick failed
+	total, cooldownCount, earliest := shard.availabilitySummaryLocked(predicate)
+	var entryStates []string
+	for authID, entry := range shard.entries {
+		if entry == nil {
+			continue
+		}
+		entryStates = append(entryStates, fmt.Sprintf("%s=%v(retry@%v)", authID, entry.state, entry.nextRetryAt))
+	}
+	log.Warnf("[调度器-诊断] pickReady失败 | provider=%s | modelKey=%s | total=%d cooldown=%d earliest=%v | 条目状态=%v",
+		providerKey, modelKey, total, cooldownCount, earliest, entryStates)
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
 }
 
@@ -283,29 +313,40 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 	normalized := normalizeProviderKeys(providers)
 	if len(normalized) == 0 {
+		log.Warnf("[调度器][凭证][选择] 无规范化provider")
 		return nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	if len(normalized) == 1 {
 		// When a single provider is eligible, reuse pickSingle so provider-specific preferences
 		// (for example Codex websocket transport) are applied consistently.
 		providerKey := normalized[0]
+		log.Infof("[调度器][凭证][选择] 单provider模式 | provider=%s | 模型=%s", providerKey, model)
 		picked, errPick := s.pickSingle(ctx, providerKey, model, opts, tried)
 		if errPick != nil {
+			log.Warnf("[调度器][凭证][选择] 单provider选择失败 | provider=%s: %v", providerKey, errPick)
 			return nil, "", errPick
 		}
 		if picked == nil {
+			log.Warnf("[调度器][凭证][选择] 单provider无可用凭证 | provider=%s", providerKey)
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		baseURL := ""
+		if picked.Attributes != nil {
+			baseURL = strings.TrimSpace(picked.Attributes["base_url"])
+		}
+		log.Infof("[调度器][凭证][选择] 单provider选中 | baseURL=%s | provider=%s", baseURL, providerKey)
 		return picked, providerKey, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
+	log.Infof("[调度器][凭证][选择] 多provider模式 | providers=%v | 模型=%s | 固定authID=%s", normalized, model, pinnedAuthID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
+			log.Warnf("[调度器-选择] 固定auth不在候选provider中 | pinnedAuthID=%s", pinnedAuthID)
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
 		providerState := s.providers[providerKey]
@@ -324,6 +365,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			return !ok
 		}
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+			log.Infof("[调度器-选择] ✓ 固定auth命中 | authID=%s", picked.ID)
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -421,6 +463,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if picked == nil {
 			continue
 		}
+		log.Infof("[调度器-选择] Round-Robin轮转选中 | provider=%s | authID=%s | 优先级=%d | cursorSlot=%d/%d", providerKey, picked.ID, bestPriority, slot, totalWeight)
 		s.mixedCursors[cursorKey] = slot + 1
 		return picked, providerKey, nil
 	}
@@ -888,6 +931,48 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 	return total, cooldownCount, earliest
 }
 
+// readyCountForModelLocked returns the number of ready (immediately usable) auths in the shard.
+func (m *modelScheduler) readyCountForModelLocked() int {
+	if m == nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if entry.state == scheduledStateReady {
+			count++
+		}
+	}
+	return count
+}
+
+// readyCountForProviders returns the total number of ready auths across the given
+// providers for the model. It is used to detect single-credential routing where
+// waiting for cooldown cannot yield an alternate credential.
+func (s *authScheduler) readyCountForProviders(providers []string, model string) int {
+	if s == nil || len(providers) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	modelKey := canonicalModelKey(model)
+	total := 0
+	for _, providerKey := range providers {
+		ps := s.providers[strings.ToLower(strings.TrimSpace(providerKey))]
+		if ps == nil {
+			continue
+		}
+		shard := ps.modelShards[modelKey]
+		if shard == nil {
+			continue
+		}
+		total += shard.readyCountForModelLocked()
+	}
+	return total
+}
+
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
 func (m *modelScheduler) rebuildIndexesLocked() {
 	cursorStates := make(map[int]readyBucketCursorState, len(m.readyByPriority))
@@ -1053,4 +1138,15 @@ func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool) *
 		}
 	}
 	return nil
+}
+
+func mapKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

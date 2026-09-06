@@ -49,8 +49,12 @@ type Config struct {
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
-	// Debug enables or disables debug-level logging and other debug features.
+	// Debug enables debug-mode behavior and remains the legacy switch for log verbosity.
 	Debug bool `yaml:"debug" json:"debug"`
+
+	// LogLevel overrides Debug when set. Supported values are panic, fatal, error, warn,
+	// info, debug, and trace.
+	LogLevel string `yaml:"log-level,omitempty" json:"log-level,omitempty"`
 
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
@@ -69,7 +73,7 @@ type Config struct {
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
 
-	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
+	// UsageStatisticsEnabled toggles token usage aggregation and SQLite persistence; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
 	// RedisUsageQueueRetentionSeconds controls how long usage queue items are retained
@@ -479,6 +483,9 @@ type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Label is a user-defined display label for this provider entry.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -535,6 +542,9 @@ type CodexKey struct {
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Label is a user-defined display label for this provider entry.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -586,6 +596,9 @@ type GeminiKey struct {
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Label is a user-defined display label for this provider entry.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -610,6 +623,9 @@ type GeminiKey struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// Disabled prevents this credential from being used for routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 func (k GeminiKey) GetAPIKey() string  { return k.APIKey }
@@ -632,6 +648,9 @@ func (m GeminiModel) GetAlias() string { return m.Alias }
 type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
+
+	// Label is a user-defined display label for this provider entry.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
 
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
@@ -734,7 +753,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
-	cfg.UsageStatisticsEnabled = false
+	cfg.UsageStatisticsEnabled = true
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
 	cfg.DisableImageGeneration = DisableImageGenerationOff
@@ -1004,6 +1023,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 	for i := range cfg.OpenAICompatibility {
 		e := cfg.OpenAICompatibility[i]
 		e.Name = strings.TrimSpace(e.Name)
+		e.Label = strings.TrimSpace(e.Label)
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
@@ -1025,6 +1045,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 	out := make([]CodexKey, 0, len(cfg.CodexKey))
 	for i := range cfg.CodexKey {
 		e := cfg.CodexKey[i]
+		e.Label = strings.TrimSpace(e.Label)
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
@@ -1044,6 +1065,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	}
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
+		entry.Label = strings.TrimSpace(entry.Label)
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
@@ -1062,6 +1084,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 	for i := range cfg.GeminiKey {
 		entry := cfg.GeminiKey[i]
 		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		entry.Label = strings.TrimSpace(entry.Label)
 		if entry.APIKey == "" {
 			continue
 		}

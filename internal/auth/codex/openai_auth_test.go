@@ -18,33 +18,62 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
-	var calls int32
-	auth := &CodexAuth{
-		httpClient: &http.Client{
-			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				atomic.AddInt32(&calls, 1)
-				return &http.Response{
-					StatusCode: http.StatusBadRequest,
-					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","code":"refresh_token_reused"}`)),
-					Header:     make(http.Header),
-					Request:    req,
-				}, nil
-			}),
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantError  string
+	}{
+		{
+			name:       "reused refresh token",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid_grant","code":"refresh_token_reused"}`,
+			wantError:  "refresh_token_reused",
+		},
+		{
+			name:       "invalid refresh token",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":{"message":"Invalid refresh token.","code":"invalid_refresh_token"}}`,
+			wantError:  "invalid_refresh_token",
+		},
+		{
+			name:       "unauthorized refresh",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":"unauthorized"}`,
+			wantError:  "status 401",
 		},
 	}
 
-	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
-	if err == nil {
-		t.Fatalf("expected error for non-retryable refresh failure")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "refresh_token_reused") {
-		t.Fatalf("expected refresh_token_reused in error, got: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int32
+			auth := &CodexAuth{
+				httpClient: &http.Client{
+					Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						atomic.AddInt32(&calls, 1)
+						return &http.Response{
+							StatusCode: tt.statusCode,
+							Body:       io.NopCloser(strings.NewReader(tt.body)),
+							Header:     make(http.Header),
+							Request:    req,
+						}, nil
+					}),
+				},
+			}
+
+			_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+			if err == nil {
+				t.Fatalf("expected error for non-retryable refresh failure")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), tt.wantError) {
+				t.Fatalf("expected %q in error, got: %v", tt.wantError, err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("expected 1 refresh attempt, got %d", got)
+			}
+		})
 	}
 }
-
 func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "direct")

@@ -43,7 +43,7 @@ func (h *Handler) GetUsageQueue(c *gin.Context) {
 	c.JSON(http.StatusOK, records)
 }
 
-// GetTokenUsageStatistics returns non-destructive in-memory token usage aggregates.
+// GetTokenUsageStatistics returns non-destructive persisted token usage aggregates.
 func (h *Handler) GetTokenUsageStatistics(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})

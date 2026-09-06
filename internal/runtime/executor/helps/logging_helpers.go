@@ -40,6 +40,26 @@ type UpstreamRequestLog struct {
 	AuthValue string
 }
 
+// LogUpstreamRequest writes the exact request metadata immediately before an
+// upstream HTTP client sends it. Full request bodies are trace-only because
+// they may contain prompts, tool arguments, or other sensitive user data.
+func LogUpstreamRequest(ctx context.Context, req *http.Request, body []byte) {
+	if req == nil || !log.IsLevelEnabled(log.TraceLevel) {
+		return
+	}
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("[upstream request] method=%s url=%s\nheaders:\n", req.Method, req.URL.String()))
+	writeHeaders(&builder, req.Header)
+	builder.WriteString("body:\n")
+	//if len(body) == 0 {
+	//	builder.WriteString("<empty>")
+	//} else {
+	//	builder.Write(body)
+	//}
+	LogWithRequestID(ctx).Trace(builder.String())
+}
+
 type upstreamAttempt struct {
 	index                int
 	request              string

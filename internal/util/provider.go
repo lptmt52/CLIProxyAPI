@@ -53,9 +53,11 @@ func GetProviderName(modelName string) []string {
 	}
 
 	if len(providers) > 0 {
+		// log.Infof("[Provider解析] 模型=%s → 全局注册表匹配成功 | 提供商=%v", modelName, providers)
 		return providers
 	}
 
+	log.Debugf("[Provider解析] 模型=%s → 全局注册表无匹配", modelName)
 	return providers
 }
 
@@ -213,7 +215,8 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	case strings.Contains(lowerKey, "api-key"),
 		strings.Contains(lowerKey, "apikey"),
 		strings.Contains(lowerKey, "token"),
-		strings.Contains(lowerKey, "secret"):
+		strings.Contains(lowerKey, "secret"),
+		strings.Contains(lowerKey, "cookie"):
 		return HideAPIKey(value)
 	default:
 		return value

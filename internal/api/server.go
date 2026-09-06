@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	tokenusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -876,7 +877,11 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
-	c.Data(http.StatusOK, "text/html; charset=utf-8", injectManagementTokenUsageEntry(data))
+	data = injectManagementTokenUsageEntry(data)
+	data = injectManagementAuthContentEntry(data)
+	data = injectManagementAIProvidersEntry(data)
+	data = injectManagementQuotaActionsEntry(data)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
@@ -1339,6 +1344,13 @@ func (s *Server) Start() error {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
+	usageDatabasePath := filepath.Join(filepath.Dir(s.configFilePath), "usage.db")
+	if errUsageDatabase := tokenusage.ConfigureSQLite(usageDatabasePath); errUsageDatabase != nil {
+		log.WithError(errUsageDatabase).WithField("path", usageDatabasePath).Warn("failed to initialize token usage SQLite database; using in-memory statistics")
+	} else {
+		defer tokenusage.CloseSQLite()
+	}
+
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
@@ -1424,8 +1436,10 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
+		tokenusage.CloseSQLite()
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
 	}
+	tokenusage.CloseSQLite()
 
 	log.Debug("API server stopped")
 	return nil
@@ -1526,8 +1540,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 
-	// Update log level dynamically when debug flag changes
-	if oldCfg == nil || oldCfg.Debug != cfg.Debug {
+	// Update log level dynamically when debug or explicit log-level changes.
+	if oldCfg == nil || oldCfg.Debug != cfg.Debug || strings.TrimSpace(oldCfg.LogLevel) != strings.TrimSpace(cfg.LogLevel) {
 		util.SetLogLevel(cfg)
 	}
 

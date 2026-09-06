@@ -225,8 +225,26 @@ func TestManagementTokenUsagePageAndControlPanelEntry(t *testing.T) {
 	if !strings.Contains(panelRR.Body.String(), "cliproxy-token-usage-entry") {
 		t.Fatalf("panel missing token usage entry script; body=%s", panelRR.Body.String())
 	}
-	if !strings.Contains(panelRR.Body.String(), "/management.html") || !strings.Contains(panelRR.Body.String(), "#/token-usage") {
-		t.Fatalf("panel missing token usage hash route; body=%s", panelRR.Body.String())
+	if !strings.Contains(panelRR.Body.String(), `var href = "#/dashboard?" + viewMarker`) {
+		t.Fatalf("panel missing integrated token usage route; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), `var viewMarker = "cliproxy-view=token-usage"`) {
+		t.Fatalf("panel token usage route is missing its dashboard view marker; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), `return window.__cliproxyManagementClient;`) {
+		t.Fatalf("panel token usage view does not reuse the management client; body=%s", panelRR.Body.String())
+	}
+	if strings.Contains(panelRR.Body.String(), `window.location.replace("/management-token-usage.html")`) {
+		t.Fatalf("panel still redirects token usage to the standalone page; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), "cliproxy-auth-content-entry") {
+		t.Fatalf("panel missing auth content entry script; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), "Create auth file") || !strings.Contains(panelRR.Body.String(), "input[type=\"file\"][multiple]") {
+		t.Fatalf("panel missing auth content form wiring; body=%s", panelRR.Body.String())
+	}
+	if !strings.Contains(panelRR.Body.String(), "cliproxy-ai-providers-entry") {
+		t.Fatalf("panel missing AI providers enhancement script; body=%s", panelRR.Body.String())
 	}
 }
 

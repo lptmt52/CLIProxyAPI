@@ -847,6 +847,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	})
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	helps.LogUpstreamRequest(ctx, httpReq, upstreamBody)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -858,6 +859,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	log.Debugf("[Codex执行器-非流式] 上游响应 | 状态码=%d | Content-Type=%s | 模型=%s | URL=%s", httpResp.StatusCode, httpResp.Header.Get("Content-Type"), baseModel, url)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
@@ -875,9 +877,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 
+	log.Infof("[Codex执行器-非流式] 上游返回 | 模型=%s | 响应体大小=%d字节 | URL=%s", baseModel, len(upstreamData), url)
+
 	lines := bytes.Split(upstreamData, []byte("\n"))
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	var seenEventTypes []string
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
 			continue
@@ -885,6 +890,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
+		seenEventTypes = append(seenEventTypes, eventType)
 
 		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
 			clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
@@ -945,7 +951,16 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
-	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	errMsg := "stream error: stream disconnected before completion: stream closed before response.completed"
+	log.Warnf("[Codex执行器-非流式] 未收到response.completed | 模型=%s | 收到的SSE事件类型=%v | URL=%s", baseModel, seenEventTypes, url)
+	if len(seenEventTypes) == 0 {
+		preview := string(upstreamData)
+		if len(preview) > 2000 {
+			preview = preview[:2000]
+		}
+		log.Warnf("[Codex执行器-非流式] 上游未返回任何SSE事件 | 模型=%s | 上游原始内容(前2000字):\n%s", baseModel, preview)
+	}
+	err = statusErr{code: 408, msg: errMsg}
 	return resp, err
 }
 
@@ -1013,6 +1028,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	})
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	helps.LogUpstreamRequest(ctx, httpReq, upstreamBody)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -1062,11 +1078,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
+	log.Infof("[Codex执行器] 开始执行流式请求 | 模型=%s | baseURL=%s | authID=%s | 源格式=%s", baseModel, baseURL, auth.ID, opts.SourceFormat.String())
+
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
+	log.Infof("[Codex执行器] 格式转换: %s → %s", from.String(), to.String())
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -1121,15 +1140,21 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
+	log.Infof("[Codex执行器] 发起上游HTTP请求 | URL=%s | 模型=%s | 请求体大小=%d字节", url, baseModel, len(upstreamBody))
+
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	helps.LogUpstreamRequest(ctx, httpReq, upstreamBody)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		log.Warnf("[Codex执行器] 上游请求失败 | URL=%s | err=%v", url, err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	log.Infof("[Codex执行器] 上游响应 | 状态码=%d | Content-Type=%s | URL=%s", httpResp.StatusCode, httpResp.Header.Get("Content-Type"), url)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		log.Warnf("[Codex执行器] 上游返回错误状态码=%d", httpResp.StatusCode)
 		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -1153,11 +1178,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
+		log.Infof("[Codex执行器] 开始读取SSE流 | 模型=%s", baseModel)
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		var streamHasCompleted bool
+		var streamEventTypes []string
+		var nonDataLineCount int
+		var rawPreview strings.Builder
+		const maxPreviewSize = 2048
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -1165,6 +1196,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				eventType := gjson.GetBytes(data, "type").String()
+				streamEventTypes = append(streamEventTypes, eventType)
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 					clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
@@ -1175,10 +1208,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
-				switch gjson.GetBytes(data, "type").String() {
+				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
+					streamHasCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -1186,6 +1220,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					translatedLine = append([]byte("data: "), data...)
+				}
+			} else {
+				nonDataLineCount++
+				if rawPreview.Len() < maxPreviewSize {
+					rawPreview.Write(line)
+					rawPreview.WriteByte('\n')
 				}
 			}
 
@@ -1200,11 +1240,21 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			log.Warnf("[Codex执行器] SSE流读取错误 | 模型=%s | err=%v | ctx_err=%v | response.completed=%v | 事件数量=%d | 事件类型=%v", baseModel, errScan, ctx.Err(), streamHasCompleted, len(streamEventTypes), streamEventTypes)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+			}
+		} else {
+			log.Infof("[Codex执行器] SSE流正常结束 ✓ | 模型=%s | response.completed=%v | 事件类型=%v", baseModel, streamHasCompleted, streamEventTypes)
+			if len(streamEventTypes) == 0 {
+				preview := rawPreview.String()
+				if len(preview) > 2000 {
+					preview = preview[:2000]
+				}
+				log.Warnf("[Codex执行器] 上游未返回任何SSE事件 | 模型=%s | nonDataLineCount=%d | 上游原始内容(前2000字):\n%s", baseModel, nonDataLineCount, preview)
 			}
 		}
 	}()

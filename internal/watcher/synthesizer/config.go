@@ -48,6 +48,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 	out := make([]*coreauth.Auth, 0, len(cfg.GeminiKey))
 	for i := range cfg.GeminiKey {
 		entry := cfg.GeminiKey[i]
+		if entry.Disabled {
+			continue
+		}
 		key := strings.TrimSpace(entry.APIKey)
 		if key == "" {
 			continue

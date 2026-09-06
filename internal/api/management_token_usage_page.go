@@ -20,369 +20,277 @@ func (s *Server) serveManagementTokenUsagePage(c *gin.Context) {
 
 func injectManagementTokenUsageEntry(data []byte) []byte {
 	if len(data) == 0 {
-		return []byte(managementTokenUsagePreScript + managementTokenUsageEntryScript)
+		return []byte(managementTokenUsageEntryScript)
 	}
 	html := string(data)
 	if strings.Contains(html, "cliproxy-token-usage-entry") {
 		return data
 	}
-	html = insertManagementTokenUsagePreScript(html)
 	lower := strings.ToLower(html)
 	index := strings.LastIndex(lower, "</body>")
 	if index < 0 {
-		out := make([]byte, 0, len(html)+len(managementTokenUsageEntryScript))
-		out = append(out, []byte(html)...)
-		out = append(out, managementTokenUsageEntryScript...)
-		return out
+		return []byte(html + managementTokenUsageEntryScript)
 	}
 	return []byte(html[:index] + managementTokenUsageEntryScript + html[index:])
 }
-
-func insertManagementTokenUsagePreScript(html string) string {
-	lower := strings.ToLower(html)
-	headIndex := strings.Index(lower, "<head")
-	if headIndex < 0 {
-		return managementTokenUsagePreScript + html
-	}
-	closeIndex := strings.Index(lower[headIndex:], ">")
-	if closeIndex < 0 {
-		return managementTokenUsagePreScript + html
-	}
-	insertAt := headIndex + closeIndex + 1
-	return html[:insertAt] + managementTokenUsagePreScript + html[insertAt:]
-}
-
-const managementTokenUsagePreScript = `<script id="cliproxy-token-usage-pre">
-(function () {
-  var tokenRoute = "/token-usage";
-  var pendingKey = "cliproxy.tokenUsage.pendingRoute";
-  var hashPath = (window.location.hash || "").replace(/^#/, "").split("?")[0].replace(/\/$/, "");
-  if (hashPath === tokenRoute) {
-    try { sessionStorage.setItem(pendingKey, "1"); } catch (error) {}
-    history.replaceState(null, document.title, window.location.pathname + window.location.search + "#/");
-  }
-})();
-</script>`
 
 const managementTokenUsageEntryScript = `<script id="cliproxy-token-usage-entry">
 (function () {
   if (window.__cliproxyTokenUsageEntryMounted) return;
   window.__cliproxyTokenUsageEntryMounted = true;
-  var routeHash = "#/token-usage";
-  var href = "/management.html" + routeHash;
-  var apiPath = "/v0/management/token-usage";
-  var storageKey = "cliproxy.tokenUsage.managementKey";
-  var pendingKey = "cliproxy.tokenUsage.pendingRoute";
+
+  var route = "/dashboard";
+  var viewMarker = "cliproxy-view=token-usage";
+  var href = "#/dashboard?" + viewMarker;
+  var apiPath = "/token-usage";
+  var syncTimer = null;
   var refreshTimer = null;
+  var retryTimer = null;
+  var active = false;
+  var loading = false;
+  var lastData = null;
+
   var style = document.createElement("style");
-  style.textContent = "#cliproxy-token-usage-floating{position:fixed;right:22px;bottom:22px;z-index:2147483000;display:inline-flex;align-items:center;gap:8px;border:1px solid color-mix(in srgb,var(--border-color,#d7d2c8) 72%,transparent);border-radius:999px;background:color-mix(in srgb,var(--bg-primary,#fff) 92%,transparent);color:var(--text-primary,#2d2a26);box-shadow:0 16px 38px rgba(0,0,0,.16);padding:10px 14px;font:600 13px/1.2 system-ui,-apple-system,Segoe UI,sans-serif;text-decoration:none;backdrop-filter:blur(12px)}#cliproxy-token-usage-floating:hover{transform:translateY(-1px)}#cliproxy-token-usage-nav .cliproxy-token-usage-dot{width:18px;height:18px;border-radius:999px;background:linear-gradient(135deg,#0f766e,#f59e0b);display:inline-block;box-shadow:inset 0 0 0 2px rgba(255,255,255,.45)}#cliproxy-token-usage-nav .nav-item.active{border-color:color-mix(in srgb,var(--primary-color,#0f766e) 30%,transparent);background:color-mix(in srgb,var(--primary-color,#0f766e) 10%,transparent);color:var(--primary-color,#0f766e)}#cliproxy-token-usage-view{width:100%;animation:cliproxy-token-usage-rise .32s ease-out both}#cliproxy-token-usage-view .tu-page{display:flex;flex-direction:column;gap:18px}#cliproxy-token-usage-view .tu-hero,#cliproxy-token-usage-view .tu-card,#cliproxy-token-usage-view .tu-panel{border:1px solid color-mix(in srgb,var(--border-color,#d7d2c8) 70%,transparent);border-radius:16px;background:linear-gradient(135deg,color-mix(in srgb,var(--bg-primary,#fff) 92%,transparent),color-mix(in srgb,var(--bg-secondary,#f6f2ea) 80%,transparent));box-shadow:0 18px 42px rgba(0,0,0,.12);backdrop-filter:blur(12px)}#cliproxy-token-usage-view .tu-hero{position:relative;overflow:hidden;padding:30px}#cliproxy-token-usage-view .tu-hero:after{content:'TOKENS';position:absolute;right:20px;top:-20px;font-size:min(14vw,132px);line-height:1;font-weight:900;color:color-mix(in srgb,var(--text-primary,#2d2a26) 6%,transparent);pointer-events:none}#cliproxy-token-usage-view .tu-hero-inner{position:relative;z-index:1;display:flex;justify-content:space-between;gap:20px;align-items:flex-end}#cliproxy-token-usage-view .tu-eyebrow{margin:0 0 8px;color:var(--primary-color,#0f766e);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}#cliproxy-token-usage-view h1{margin:0;color:var(--text-primary,#2d2a26);font-size:clamp(28px,5vw,48px);line-height:1.06;letter-spacing:-.04em}#cliproxy-token-usage-view .tu-subtitle{max-width:700px;margin:12px 0 0;color:var(--text-secondary,#756b5f);font-size:14px;line-height:1.6}#cliproxy-token-usage-view .tu-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}#cliproxy-token-usage-view button{border:1px solid var(--border-color,#d7d2c8);border-radius:999px;background:var(--bg-primary,#fff);color:var(--text-primary,#2d2a26);padding:9px 13px;cursor:pointer;font:inherit;font-weight:700}#cliproxy-token-usage-view button.primary{border-color:transparent;background:var(--primary-color,#0f766e);color:var(--primary-contrast,#fff)}#cliproxy-token-usage-view .tu-status{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}#cliproxy-token-usage-view .tu-pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border-color,#d7d2c8);border-radius:999px;background:color-mix(in srgb,var(--bg-primary,#fff) 70%,transparent);color:var(--text-secondary,#756b5f);padding:6px 11px;font-size:12px}#cliproxy-token-usage-view .tu-dot{width:8px;height:8px;border-radius:50%;background:#f59e0b}#cliproxy-token-usage-view .tu-dot.ok{background:#10b981;box-shadow:0 0 0 4px rgba(16,185,129,.14)}#cliproxy-token-usage-view .tu-dot.err{background:#ef4444;box-shadow:0 0 0 4px rgba(239,68,68,.14)}#cliproxy-token-usage-view .tu-login{display:none;padding:18px;border:1px solid var(--border-color,#d7d2c8);border-radius:14px;background:color-mix(in srgb,var(--bg-primary,#fff) 78%,transparent)}#cliproxy-token-usage-view .tu-login.visible{display:block}#cliproxy-token-usage-view .tu-form{display:flex;gap:10px;flex-wrap:wrap}#cliproxy-token-usage-view input{min-width:min(420px,100%);flex:1;border:1px solid var(--border-color,#d7d2c8);border-radius:999px;background:var(--bg-primary,#fff);color:var(--text-primary,#2d2a26);padding:10px 13px;font:inherit}#cliproxy-token-usage-view .tu-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}#cliproxy-token-usage-view .tu-card{position:relative;overflow:hidden;min-height:142px;padding:18px}#cliproxy-token-usage-view .tu-card:after{content:'';position:absolute;right:-40px;bottom:-48px;width:120px;height:120px;border-radius:50%;background:color-mix(in srgb,var(--primary-color,#0f766e) 10%,transparent)}#cliproxy-token-usage-view .tu-label{color:var(--text-secondary,#756b5f);font-weight:700}#cliproxy-token-usage-view .tu-value{margin-top:12px;color:var(--text-primary,#2d2a26);font-size:clamp(26px,4vw,38px);line-height:1;font-weight:900;letter-spacing:-.04em}#cliproxy-token-usage-view .tu-meta{margin-top:12px;color:var(--text-secondary,#756b5f);font-size:12px}#cliproxy-token-usage-view .tu-mini{display:flex;flex-wrap:wrap;gap:12px;margin-top:14px;color:var(--text-secondary,#756b5f);font-size:12px}#cliproxy-token-usage-view .tu-mini strong{color:var(--text-primary,#2d2a26)}#cliproxy-token-usage-view .tu-panel{overflow:hidden}#cliproxy-token-usage-view .tu-panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 18px;border-bottom:1px solid var(--border-color,#d7d2c8)}#cliproxy-token-usage-view .tu-panel h2{margin:0;font-size:18px;color:var(--text-primary,#2d2a26)}#cliproxy-token-usage-view .tu-table-wrap{overflow-x:auto}#cliproxy-token-usage-view table{width:100%;min-width:820px;border-collapse:collapse}#cliproxy-token-usage-view th,#cliproxy-token-usage-view td{padding:13px 14px;border-bottom:1px solid var(--border-color,#d7d2c8);text-align:right;font-variant-numeric:tabular-nums}#cliproxy-token-usage-view th:first-child,#cliproxy-token-usage-view td:first-child{text-align:left}#cliproxy-token-usage-view th{color:var(--text-secondary,#756b5f);font-size:12px;text-transform:uppercase;background:color-mix(in srgb,var(--bg-secondary,#f6f2ea) 72%,transparent)}#cliproxy-token-usage-view .tu-provider{display:inline-flex;align-items:center;gap:10px;font-weight:800;color:var(--text-primary,#2d2a26)}#cliproxy-token-usage-view .tu-mark{width:26px;height:26px;border-radius:9px;background:linear-gradient(135deg,#0f766e,#f59e0b)}#cliproxy-token-usage-view .muted{color:var(--text-secondary,#756b5f)}#cliproxy-token-usage-view .empty{padding:24px;text-align:center;color:var(--text-secondary,#756b5f)}@keyframes cliproxy-token-usage-rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}@media(max-width:980px){#cliproxy-token-usage-view .tu-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#cliproxy-token-usage-view .tu-hero-inner{flex-direction:column;align-items:flex-start}#cliproxy-token-usage-view .tu-actions{justify-content:flex-start}}@media(max-width:560px){#cliproxy-token-usage-view .tu-grid{grid-template-columns:1fr}#cliproxy-token-usage-view .tu-hero{padding:22px}#cliproxy-token-usage-view .tu-form{display:block}#cliproxy-token-usage-view .tu-form button{margin-top:10px;width:100%}}";
+  style.textContent = "#cliproxy-token-usage-nav .cliproxy-token-usage-dot{width:18px;height:18px;border-radius:999px;background:var(--primary-color,#2563eb);display:inline-block;box-shadow:inset 0 0 0 2px rgba(255,255,255,.45)}#cliproxy-token-usage-view{width:100%;animation:cliproxy-token-usage-rise .2s ease-out both}#cliproxy-token-usage-view .tu-page{display:grid;gap:16px}#cliproxy-token-usage-view .tu-hero,#cliproxy-token-usage-view .tu-card,#cliproxy-token-usage-view .tu-panel{border:1px solid var(--border-color,#e5e7eb);border-radius:12px;background:var(--bg-primary,#fff)}#cliproxy-token-usage-view .tu-hero{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:22px}#cliproxy-token-usage-view .tu-eyebrow{margin:0 0 5px;color:var(--primary-color,#2563eb);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}#cliproxy-token-usage-view h1{margin:0;color:var(--text-primary,#111827);font-size:30px}#cliproxy-token-usage-view .tu-subtitle{margin:8px 0 0;color:var(--text-secondary,#6b7280)}#cliproxy-token-usage-view .tu-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}#cliproxy-token-usage-view button{border:0;border-radius:8px;background:var(--primary-color,#2563eb);color:var(--primary-contrast,#fff);padding:9px 14px;cursor:pointer;font:inherit;font-weight:600}#cliproxy-token-usage-view button:disabled{cursor:wait;opacity:.65}#cliproxy-token-usage-view .tu-status{margin-top:10px;color:var(--text-secondary,#6b7280);font-size:12px}#cliproxy-token-usage-view .tu-status.ok{color:#16a34a}#cliproxy-token-usage-view .tu-status.err{color:#dc2626}#cliproxy-token-usage-view .tu-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}#cliproxy-token-usage-view .tu-card{padding:17px}#cliproxy-token-usage-view .tu-label{color:var(--text-secondary,#6b7280);font-size:13px;font-weight:600}#cliproxy-token-usage-view .tu-value{margin-top:9px;color:var(--text-primary,#111827);font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}#cliproxy-token-usage-view .tu-meta,#cliproxy-token-usage-view .tu-mini{margin-top:8px;color:var(--text-secondary,#6b7280);font-size:12px}#cliproxy-token-usage-view .tu-mini{display:flex;gap:12px;flex-wrap:wrap}#cliproxy-token-usage-view .tu-panel{overflow:hidden}#cliproxy-token-usage-view .tu-panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid var(--border-color,#e5e7eb)}#cliproxy-token-usage-view .tu-panel h2{margin:0;color:var(--text-primary,#111827);font-size:17px}#cliproxy-token-usage-view .tu-table-wrap{overflow-x:auto}#cliproxy-token-usage-view table{width:100%;min-width:850px;border-collapse:collapse}#cliproxy-token-usage-view th,#cliproxy-token-usage-view td{padding:12px 13px;border-bottom:1px solid var(--border-color,#e5e7eb);text-align:right;font-variant-numeric:tabular-nums}#cliproxy-token-usage-view th:first-child,#cliproxy-token-usage-view td:first-child{text-align:left}#cliproxy-token-usage-view th{color:var(--text-secondary,#6b7280);font-size:12px;background:var(--bg-secondary,#f9fafb)}#cliproxy-token-usage-view .tu-provider{font-weight:700;color:var(--text-primary,#111827)}#cliproxy-token-usage-view .muted,#cliproxy-token-usage-view .empty{color:var(--text-secondary,#6b7280)}#cliproxy-token-usage-view .empty{padding:24px;text-align:center}@keyframes cliproxy-token-usage-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}@media(max-width:900px){#cliproxy-token-usage-view .tu-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#cliproxy-token-usage-view .tu-hero{align-items:flex-start;flex-direction:column}}@media(max-width:560px){#cliproxy-token-usage-view .tu-grid{grid-template-columns:1fr}}";
   document.head.appendChild(style);
 
-  function addFloating() {
-    if (document.getElementById("cliproxy-token-usage-floating")) return;
-    var link = document.createElement("a");
-    link.id = "cliproxy-token-usage-floating";
-    link.href = href;
-    link.target = "_self";
-    link.setAttribute("data-cliproxy-token-usage-link", "1");
-    link.textContent = "Token 统计";
-    document.body.appendChild(link);
+  function currentRoute() {
+    return (window.location.hash || "").replace(/^#/, "").split("?")[0].replace(/\/$/, "");
+  }
+
+  function isActive() {
+    return currentRoute() === route && (window.location.hash || "").indexOf(viewMarker) !== -1;
+  }
+
+  function contentHost() {
+    return document.querySelector(".main-content") || document.querySelector("main") || null;
   }
 
   function addSidebar() {
-    if (document.getElementById("cliproxy-token-usage-nav")) return true;
+    if (document.getElementById("cliproxy-token-usage-nav")) return;
     var section = document.querySelector(".nav-section");
-    if (!section) return false;
+    if (!section) return;
     var group = document.createElement("div");
     group.id = "cliproxy-token-usage-nav";
     group.className = "nav-group";
-    group.innerHTML = '<a class="nav-item" data-cliproxy-token-usage-link="1" href="' + href + '" title="Token 统计"><span class="nav-icon"><span class="cliproxy-token-usage-dot"></span></span><span class="nav-text"><span class="nav-label">Token 统计</span><span class="nav-meta">按提供商查看用量</span></span></a>';
+    group.innerHTML = '<a class="nav-item" href="' + href + '" title="Token 统计"><span class="nav-icon"><span class="cliproxy-token-usage-dot"></span></span><span class="nav-text"><span class="nav-label">Token 统计</span><span class="nav-meta">按提供商查看用量</span></span></a>';
     section.appendChild(group);
-    setNavActive(isTokenUsageRoute());
-    return true;
   }
 
-  function navigateTokenUsage() {
-    history.pushState(null, document.title, window.location.pathname + window.location.search + routeHash);
-    renderTokenUsageView();
+  function setNavActive(value) {
+    var link = document.querySelector("#cliproxy-token-usage-nav .nav-item");
+    if (link) link.classList.toggle("active", !!value);
+    if (value) {
+      Array.prototype.forEach.call(document.querySelectorAll(".nav-item.active"), function (item) {
+        if (item !== link) item.classList.remove("active");
+      });
+    }
   }
 
-  function isTokenUsageRoute() {
-    var hashPath = (window.location.hash || "").replace(/^#/, "").split("?")[0].replace(/\/$/, "");
-    return hashPath === "/token-usage";
-  }
-
-  function showOriginalContent(show) {
-    var host = findContentHost();
-    if (!host) return;
+  function hideOriginalContent(host, root) {
     Array.prototype.forEach.call(host.children, function (child) {
-      if (child.id === "cliproxy-token-usage-view") return;
-      if (show) {
-        if (child.hasAttribute("data-cliproxy-token-usage-old-display")) {
-          child.style.display = child.getAttribute("data-cliproxy-token-usage-old-display");
-          child.removeAttribute("data-cliproxy-token-usage-old-display");
-        } else {
-          child.style.display = "";
-        }
-      } else {
-        if (!child.hasAttribute("data-cliproxy-token-usage-old-display")) {
-          child.setAttribute("data-cliproxy-token-usage-old-display", child.style.display || "");
-        }
-        child.style.display = "none";
+      if (child === root) return;
+      if (!child.hasAttribute("data-cliproxy-token-usage-old-display")) {
+        child.setAttribute("data-cliproxy-token-usage-old-display", child.style.display || "");
       }
+      if (child.style.display !== "none") child.style.display = "none";
     });
   }
 
-  function findContentHost() {
-    return document.querySelector(".main-content") || document.querySelector("main") || document.getElementById("root") || document.body;
+  function restoreOriginalContent() {
+    Array.prototype.forEach.call(document.querySelectorAll("[data-cliproxy-token-usage-old-display]"), function (element) {
+      element.style.display = element.getAttribute("data-cliproxy-token-usage-old-display") || "";
+      element.removeAttribute("data-cliproxy-token-usage-old-display");
+    });
   }
 
-  function ensureViewRoot() {
-    var host = findContentHost();
-    if (!host) return null;
-    showOriginalContent(false);
-    var root = host.querySelector("#cliproxy-token-usage-view");
-    if (!root) {
-      root = document.createElement("section");
-      root.id = "cliproxy-token-usage-view";
-      host.appendChild(root);
-    }
-    root.style.display = "";
+  function createView(host) {
+    var root = document.createElement("section");
+    root.id = "cliproxy-token-usage-view";
+    root.innerHTML = '<div class="tu-page"><section class="tu-hero"><div><p class="tu-eyebrow">CLI Proxy API</p><h1>Token 使用统计</h1><p class="tu-subtitle">统计数据来自本地 SQLite，管理中心会复用当前登录状态，不需要重新输入密钥。</p><div id="tu-status" class="tu-status">正在读取统计</div></div><div class="tu-actions"><button id="tu-refresh" type="button">刷新数据</button></div></section><section id="tu-cards" class="tu-grid"></section><section class="tu-panel"><div class="tu-panel-head"><h2>按 AI 提供商统计</h2><span id="tu-provider-count" class="muted">-</span></div><div class="tu-table-wrap"><table><thead><tr><th>提供商</th><th>总 Token</th><th>今日</th><th>本周</th><th>本月</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>推理</th></tr></thead><tbody id="tu-provider-body"><tr><td colspan="10" class="empty">等待数据</td></tr></tbody></table></div></section></div>';
+    host.appendChild(root);
+    root.querySelector("#tu-refresh").addEventListener("click", function () {
+      refresh(root, false);
+    });
+    renderEmptyCards(root);
+    if (lastData) renderData(root, lastData);
     return root;
   }
 
-  function clearTokenUsageView() {
+  function ensureView() {
+    var host = contentHost();
+    if (!host) return null;
     var root = document.getElementById("cliproxy-token-usage-view");
-    if (root) root.style.display = "none";
-    showOriginalContent(true);
+    if (!root || root.parentElement !== host) {
+      if (root) root.remove();
+      root = createView(host);
+    }
+    hideOriginalContent(host, root);
+    return root;
+  }
+
+  function clearView() {
+    var root = document.getElementById("cliproxy-token-usage-view");
+    if (root) root.remove();
+    restoreOriginalContent();
     setNavActive(false);
-    if (refreshTimer) {
-      clearInterval(refreshTimer);
-      refreshTimer = null;
+  }
+
+  function scheduleSync() {
+    if (syncTimer !== null) return;
+    syncTimer = setTimeout(syncRoute, 80);
+  }
+
+  function syncRoute() {
+    syncTimer = null;
+    addSidebar();
+    if (!isActive()) {
+      if (active) {
+        active = false;
+        if (refreshTimer !== null) clearInterval(refreshTimer);
+        refreshTimer = null;
+      }
+      clearView();
+      return;
     }
-  }
 
-  function setNavActive(active) {
-    var link = document.querySelector("#cliproxy-token-usage-nav .nav-item");
-    if (link) link.classList.toggle("active", !!active);
-  }
-
-  function renderTokenUsageView() {
-    var root = ensureViewRoot();
-    if (!root) return;
+    var root = ensureView();
     setNavActive(true);
-    if (!root.getAttribute("data-ready")) {
-      root.setAttribute("data-ready", "1");
-      root.innerHTML = '<div class="tu-page"><section class="tu-hero"><div class="tu-hero-inner"><div><p class="tu-eyebrow">CLI Proxy API</p><h1>Token 使用统计</h1><p class="tu-subtitle">按 AI 提供商汇总当前进程内的 token 用量，包含总使用、今日、本周和本月数据。统计只在 usage-statistics-enabled 开启后采集。</p><div class="tu-status"><span class="tu-pill"><span id="tu-status-dot" class="tu-dot"></span><span id="tu-status-text">等待认证</span></span><span class="tu-pill">更新时间：<span id="tu-updated-at">-</span></span><span class="tu-pill">统计范围：当前进程内存</span></div></div><div class="tu-actions"><button id="tu-refresh" class="primary" type="button">刷新数据</button><button id="tu-clear-key" type="button">清除密钥</button></div></div></section><section id="tu-login" class="tu-login"><form id="tu-form" class="tu-form"><input id="tu-key" type="password" autocomplete="current-password" placeholder="输入管理密钥"><button class="primary" type="submit">保存并读取统计</button></form><p class="muted">如果你已经在管理中心登录，本页会尽量自动读取同源本地存储中的管理密钥；不同面板版本不兼容时，可在这里手动输入。</p></section><section id="tu-cards" class="tu-grid"></section><section class="tu-panel"><div class="tu-panel-head"><h2>按 AI 提供商统计</h2><span id="tu-provider-count" class="muted">-</span></div><div class="tu-table-wrap"><table><thead><tr><th>提供商</th><th>总 Token</th><th>今日</th><th>本周</th><th>本月</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>推理</th></tr></thead><tbody id="tu-provider-body"><tr><td colspan="10" class="empty">等待数据</td></tr></tbody></table></div></section></div>';
-      bindTokenUsageView(root);
+    if (!root) {
+      syncTimer = setTimeout(syncRoute, 160);
+      return;
     }
-    refreshTokenUsage(root, true);
-    if (!refreshTimer) {
+    if (!active) {
+      active = true;
+      refresh(root, false);
       refreshTimer = setInterval(function () {
-        if (isTokenUsageRoute() && document.visibilityState === "visible") refreshTokenUsage(root, true);
+        if (active && document.visibilityState === "visible") {
+          var current = document.getElementById("cliproxy-token-usage-view");
+          if (current) refresh(current, true);
+        }
       }, 15000);
     }
   }
 
-  function bindTokenUsageView(root) {
-    renderEmptyCards(root);
-    var key = findInitialKey();
-    var login = root.querySelector("#tu-login");
-    var input = root.querySelector("#tu-key");
-    input.value = key || "";
-    login.classList.toggle("visible", !key);
-    root.querySelector("#tu-form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      var value = input.value.trim();
-      if (!value) {
-        setStatus(root, "err", "请输入管理密钥");
-        return;
-      }
-      try { localStorage.setItem(storageKey, value); } catch (error) {}
-      login.classList.remove("visible");
-      refreshTokenUsage(root, false);
-    });
-    root.querySelector("#tu-refresh").addEventListener("click", function () { refreshTokenUsage(root, false); });
-    root.querySelector("#tu-clear-key").addEventListener("click", function () {
-      try { localStorage.removeItem(storageKey); } catch (error) {}
-      input.value = "";
-      login.classList.add("visible");
-      setStatus(root, "", "已清除密钥");
-    });
+  function managementClient() {
+    return window.__cliproxyManagementClient;
   }
 
-  async function refreshTokenUsage(root, silent) {
-    var key = (root.querySelector("#tu-key").value || findInitialKey()).trim();
-    if (!key) {
-      root.querySelector("#tu-login").classList.add("visible");
-      setStatus(root, "", "需要管理密钥");
+  function refresh(root, silent) {
+    if (!root || loading) return;
+    var api = managementClient();
+    if (!api || typeof api.get !== "function") {
+      setStatus(root, "", "正在等待管理中心完成初始化");
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = setTimeout(function () {
+        retryTimer = null;
+        if (active) refresh(document.getElementById("cliproxy-token-usage-view"), true);
+      }, 180);
       return;
     }
-    if (!silent) setStatus(root, "", "正在读取统计");
+
+    loading = true;
     var button = root.querySelector("#tu-refresh");
     if (button) button.disabled = true;
-    try {
-      var response = await fetch(apiPath, { headers: { "Authorization": "Bearer " + key, "X-Management-Key": key }, cache: "no-store" });
-      if (response.status === 401 || response.status === 403) throw new Error("认证失败，请重新输入管理密钥");
-      if (response.status === 404) throw new Error("当前服务未提供 token 统计接口，请确认已经启动新编译的 exe");
-      if (!response.ok) throw new Error("读取失败 HTTP " + response.status);
-      var data = await response.json();
-      renderUsageData(root, data);
-      try { localStorage.setItem(storageKey, key); } catch (error) {}
-      root.querySelector("#tu-login").classList.remove("visible");
-      setStatus(root, data.enabled ? "ok" : "", data.enabled ? "统计已开启" : "统计开关未开启");
-    } catch (error) {
-      setStatus(root, "err", error.message || "读取失败");
-      if (/认证失败/.test(error.message || "")) root.querySelector("#tu-login").classList.add("visible");
-    } finally {
-      if (button) button.disabled = false;
-    }
+    if (!silent) setStatus(root, "", "正在读取统计");
+    api.get(apiPath).then(function (data) {
+      lastData = data || {};
+      var current = document.getElementById("cliproxy-token-usage-view");
+      if (current) renderData(current, lastData);
+      setStatus(current, lastData.enabled ? "ok" : "", lastData.enabled ? "统计已开启" : "统计开关未开启");
+    }).catch(function (error) {
+      setStatus(document.getElementById("cliproxy-token-usage-view"), "err", error && error.message ? error.message : "读取统计失败");
+    }).finally(function () {
+      loading = false;
+      var current = document.getElementById("cliproxy-token-usage-view");
+      var currentButton = current && current.querySelector("#tu-refresh");
+      if (currentButton) currentButton.disabled = false;
+    });
   }
 
-  function renderUsageData(root, data) {
-    var updated = root.querySelector("#tu-updated-at");
-    updated.textContent = formatDateTime(data && data.generated_at);
+  function renderData(root, data) {
+    if (!root) return;
     var summaries = [
-      { title: "总使用", hint: "当前进程累计", bucket: data && data.total },
-      { title: "今日", hint: periodHint(data && data.day), bucket: data && data.day },
-      { title: "本周", hint: periodHint(data && data.week), bucket: data && data.week },
-      { title: "本月", hint: periodHint(data && data.month), bucket: data && data.month }
+      { title: "总使用", hint: "SQLite 历史累计", bucket: data.total },
+      { title: "今日", hint: periodHint(data.day), bucket: data.day },
+      { title: "本周", hint: periodHint(data.week), bucket: data.week },
+      { title: "本月", hint: periodHint(data.month), bucket: data.month }
     ];
     root.querySelector("#tu-cards").innerHTML = summaries.map(function (item) {
       var bucket = normalizeBucket(item.bucket);
       return '<article class="tu-card"><div class="tu-label">' + escapeHtml(item.title) + '</div><div class="tu-value">' + number(bucket.tokens.total_tokens) + '</div><div class="tu-meta">' + escapeHtml(item.hint) + '</div><div class="tu-mini"><span>请求 <strong>' + number(bucket.requests) + '</strong></span><span>失败 <strong>' + number(bucket.failed_requests) + '</strong></span><span>输出 <strong>' + number(bucket.tokens.output_tokens) + '</strong></span></div></article>';
     }).join("");
-    var providers = Array.isArray(data && data.providers) ? data.providers.slice() : [];
-    providers.sort(function (left, right) { return tokenTotal(right.total) - tokenTotal(left.total) || String(left.provider).localeCompare(String(right.provider)); });
+
+    var providers = Array.isArray(data.providers) ? data.providers.slice() : [];
+    providers.sort(function (left, right) {
+      return tokenTotal(right.total) - tokenTotal(left.total) || String(left.provider).localeCompare(String(right.provider));
+    });
     root.querySelector("#tu-provider-count").textContent = providers.length ? providers.length + " 个提供商" : "暂无提供商";
+    var body = root.querySelector("#tu-provider-body");
     if (!providers.length) {
-      root.querySelector("#tu-provider-body").innerHTML = '<tr><td colspan="10" class="empty">还没有 token 使用记录。请通过代理发起一次模型请求后再刷新。</td></tr>';
+      body.innerHTML = '<tr><td colspan="10" class="empty">还没有 Token 使用记录</td></tr>';
       return;
     }
-    root.querySelector("#tu-provider-body").innerHTML = providers.map(function (provider) {
+    body.innerHTML = providers.map(function (provider) {
       var total = normalizeBucket(provider.total);
-      return '<tr><td><span class="tu-provider"><span class="tu-mark"></span>' + escapeHtml(provider.provider || "unknown") + '</span></td><td>' + number(total.tokens.total_tokens) + '</td><td>' + number(tokenTotal(provider.day)) + '</td><td>' + number(tokenTotal(provider.week)) + '</td><td>' + number(tokenTotal(provider.month)) + '</td><td>' + number(total.requests) + '</td><td>' + number(total.failed_requests) + '</td><td>' + number(total.tokens.input_tokens) + '</td><td>' + number(total.tokens.output_tokens) + '</td><td>' + number(total.tokens.reasoning_tokens) + '</td></tr>';
+      return '<tr><td><span class="tu-provider">' + escapeHtml(provider.provider || "unknown") + '</span></td><td>' + number(total.tokens.total_tokens) + '</td><td>' + number(tokenTotal(provider.day)) + '</td><td>' + number(tokenTotal(provider.week)) + '</td><td>' + number(tokenTotal(provider.month)) + '</td><td>' + number(total.requests) + '</td><td>' + number(total.failed_requests) + '</td><td>' + number(total.tokens.input_tokens) + '</td><td>' + number(total.tokens.output_tokens) + '</td><td>' + number(total.tokens.reasoning_tokens) + '</td></tr>';
     }).join("");
   }
 
   function renderEmptyCards(root) {
     root.querySelector("#tu-cards").innerHTML = ["总使用", "今日", "本周", "本月"].map(function (title) {
-      return '<article class="tu-card"><div class="tu-label">' + title + '</div><div class="tu-value">0</div><div class="tu-meta">等待数据</div><div class="tu-mini"><span>请求 <strong>0</strong></span><span>失败 <strong>0</strong></span></div></article>';
+      return '<article class="tu-card"><div class="tu-label">' + title + '</div><div class="tu-value">0</div><div class="tu-meta">等待数据</div></article>';
     }).join("");
   }
 
-  function findInitialKey() {
-    var direct = cleanKey(localStorage.getItem(storageKey) || sessionStorage.getItem(storageKey));
-    if (direct) return direct;
-    var names = ["managementKey", "management-key", "management_key", "cliproxy-management-key", "cpa-management-key"];
-    for (var i = 0; i < names.length; i++) {
-      var value = cleanKey(localStorage.getItem(names[i]) || sessionStorage.getItem(names[i]));
-      if (value) return value;
-    }
-    return scanStorageForManagementKey(localStorage) || scanStorageForManagementKey(sessionStorage) || "";
-  }
-
-  function scanStorageForManagementKey(storage) {
-    try {
-      for (var i = 0; i < storage.length; i++) {
-        var name = storage.key(i);
-        var value = storage.getItem(name);
-        if (/management.*key/i.test(name || "")) {
-          var direct = cleanKey(value);
-          if (direct && direct.charAt(0) !== "{" && direct.charAt(0) !== "[") return direct;
-        }
-        var found = extractKey(tryJSON(value), 0);
-        if (found) return found;
-      }
-    } catch (error) {}
-    return "";
-  }
-
-  function extractKey(value, depth) {
-    if (!value || typeof value !== "object" || depth > 6) return "";
-    var preferred = ["managementKey", "management_key", "management-key"];
-    for (var i = 0; i < preferred.length; i++) {
-      var candidate = cleanKey(value[preferred[i]]);
-      if (candidate) return candidate;
-    }
-    if (value.state) {
-      var nested = extractKey(value.state, depth + 1);
-      if (nested) return nested;
-    }
-    for (var keyName in value) {
-      if (!Object.prototype.hasOwnProperty.call(value, keyName)) continue;
-      if (/management.*key/i.test(keyName)) {
-        var direct = cleanKey(value[keyName]);
-        if (direct) return direct;
-      }
-      var found = extractKey(value[keyName], depth + 1);
-      if (found) return found;
-    }
-    return "";
-  }
-
-  function tryJSON(value) { try { return value ? JSON.parse(value) : null; } catch (error) { return null; } }
-  function cleanKey(value) { return typeof value === "string" ? value.trim().replace(/^['"]|['"]$/g, "").trim() : ""; }
   function normalizeBucket(bucket) {
     bucket = bucket || {};
-    bucket.tokens = bucket.tokens || {};
-    return { requests: bucket.requests || 0, successful_requests: bucket.successful_requests || 0, failed_requests: bucket.failed_requests || 0, tokens: { input_tokens: bucket.tokens.input_tokens || 0, output_tokens: bucket.tokens.output_tokens || 0, reasoning_tokens: bucket.tokens.reasoning_tokens || 0, cached_tokens: bucket.tokens.cached_tokens || 0, cache_read_tokens: bucket.tokens.cache_read_tokens || 0, cache_creation_tokens: bucket.tokens.cache_creation_tokens || 0, total_tokens: bucket.tokens.total_tokens || 0 } };
-  }
-  function tokenTotal(bucket) { return normalizeBucket(bucket).tokens.total_tokens; }
-  function periodHint(bucket) { return bucket && bucket.label ? bucket.label : "当前周期"; }
-  function formatDateTime(value) { var date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : "-"; }
-  function number(value) { return new Intl.NumberFormat("zh-CN").format(Number(value) || 0); }
-  function escapeHtml(value) { return String(value == null ? "" : value).replace(/[&<>"']/g, function (char) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]; }); }
-  function setStatus(root, type, text) {
-    var dot = root.querySelector("#tu-status-dot");
-    dot.className = "tu-dot" + (type ? " " + type : "");
-    root.querySelector("#tu-status-text").textContent = text;
+    var tokens = bucket.tokens || {};
+    return {
+      requests: bucket.requests || 0,
+      failed_requests: bucket.failed_requests || 0,
+      tokens: {
+        input_tokens: tokens.input_tokens || 0,
+        output_tokens: tokens.output_tokens || 0,
+        reasoning_tokens: tokens.reasoning_tokens || 0,
+        total_tokens: tokens.total_tokens || 0
+      }
+    };
   }
 
-  document.addEventListener("click", function (event) {
-    var link = event.target && event.target.closest ? event.target.closest("[data-cliproxy-token-usage-link]") : null;
-    if (link) {
-      event.preventDefault();
-      navigateTokenUsage();
-      return;
-    }
-    if (event.target && event.target.closest && event.target.closest(".nav-item")) {
-      setTimeout(function () { if (!isTokenUsageRoute()) clearTokenUsageView(); }, 60);
-    }
-  });
-
-  window.addEventListener("popstate", function () {
-    if (isTokenUsageRoute()) renderTokenUsageView();
-    else clearTokenUsageView();
-  });
-  window.addEventListener("hashchange", function () {
-    if (isTokenUsageRoute()) renderTokenUsageView();
-    else clearTokenUsageView();
-  });
-
-  addFloating();
-  addSidebar();
-  try {
-    if (sessionStorage.getItem(pendingKey) === "1") {
-      sessionStorage.removeItem(pendingKey);
-      history.replaceState(null, document.title, window.location.pathname + window.location.search + routeHash);
-      renderTokenUsageView();
-    } else if (isTokenUsageRoute()) {
-      renderTokenUsageView();
-    }
-  } catch (error) {
-    if (isTokenUsageRoute()) renderTokenUsageView();
+  function tokenTotal(bucket) {
+    return normalizeBucket(bucket).tokens.total_tokens;
   }
-  var observer = new MutationObserver(function () {
-    addSidebar();
-    if (isTokenUsageRoute()) {
-      renderTokenUsageView();
-    }
-  });
+
+  function periodHint(bucket) {
+    return bucket && bucket.label ? bucket.label : "当前周期";
+  }
+
+  function number(value) {
+    return new Intl.NumberFormat("zh-CN").format(Number(value) || 0);
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function (character) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character];
+    });
+  }
+
+  function setStatus(root, type, message) {
+    if (!root) return;
+    var status = root.querySelector("#tu-status");
+    if (!status) return;
+    status.className = "tu-status" + (type ? " " + type : "");
+    if (status.textContent !== message) status.textContent = message;
+  }
+
+  window.addEventListener("hashchange", scheduleSync);
+  window.addEventListener("popstate", scheduleSync);
+  var observer = new MutationObserver(scheduleSync);
   observer.observe(document.documentElement, { childList: true, subtree: true });
+  scheduleSync();
 })();
 </script>`
-
 const managementTokenUsageHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -561,11 +469,11 @@ const managementTokenUsageHTML = `<!doctype html>
         <div>
           <p class="eyebrow">CLI Proxy API</p>
           <h1>Token 使用统计</h1>
-          <p class="subtitle">按 AI 提供商汇总当前进程内的 token 用量，包含总使用、今日、本周和本月数据。统计只在 <code>usage-statistics-enabled</code> 开启后采集。</p>
+          <p class="subtitle">按 AI 提供商汇总本地累计的 token 用量，包含总使用、今日、本周和本月数据。统计只在 <code>usage-statistics-enabled</code> 开启后采集；统计数据存储在本地 SQLite 数据库中。</p>
           <div class="status-row">
             <span class="pill"><span id="status-dot" class="dot warn"></span><span id="status-text">等待认证</span></span>
             <span class="pill">更新时间：<span id="updated-at">-</span></span>
-            <span class="pill">统计范围：当前进程内存</span>
+            <span class="pill">统计范围：本地 SQLite</span>
           </div>
         </div>
         <div class="actions">
@@ -709,7 +617,7 @@ const managementTokenUsageHTML = `<!doctype html>
       function render(data) {
         updatedAt.textContent = formatDateTime(data.generated_at);
         var summaries = [
-          { title: "总使用", hint: "当前进程累计", bucket: data.total },
+          { title: "总使用", hint: "SQLite 历史累计", bucket: data.total },
           { title: "今日", hint: periodHint(data.day), bucket: data.day },
           { title: "本周", hint: periodHint(data.week), bucket: data.week },
           { title: "本月", hint: periodHint(data.month), bucket: data.month }

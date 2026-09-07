@@ -31,6 +31,26 @@ plugins: {}
 	}
 }
 
+func TestParseConfigBytes_OpenAICompatibilityHealthProbe(t *testing.T) {
+	cfg, errParse := ParseConfigBytes([]byte(`
+openai-compatibility:
+  - name: provider-a
+    base-url: https://example.com/v1
+    health-probe-enabled: true
+    health-probe-interval-seconds: 17
+`))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	if len(cfg.OpenAICompatibility) != 1 {
+		t.Fatalf("OpenAICompatibility len = %d, want 1", len(cfg.OpenAICompatibility))
+	}
+	entry := cfg.OpenAICompatibility[0]
+	if !entry.HealthProbeEnabled || entry.HealthProbeIntervalSeconds != 17 {
+		t.Fatalf("health probe config = %#v", entry)
+	}
+}
+
 func TestParseConfigBytes_PluginInstanceEmptyRawYAML(t *testing.T) {
 	cfg, errParse := ParseConfigBytes([]byte(`
 plugins:

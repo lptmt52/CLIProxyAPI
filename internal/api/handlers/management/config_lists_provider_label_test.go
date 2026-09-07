@@ -64,6 +64,40 @@ func TestPatchGeminiKeyUpdatesProviderLabel(t *testing.T) {
 	}
 }
 
+func TestPatchOpenAICompatUpdatesHealthProbeFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := &Handler{
+		cfg: &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:    "provider-a",
+			BaseURL: "https://example.com/v1",
+		}}},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/openai-compatibility", bytes.NewBufferString(`{"index":0,"value":{"health-probe-enabled":true,"health-probe-interval-seconds":17}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchOpenAICompat(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	entry := h.cfg.OpenAICompatibility[0]
+	if !entry.HealthProbeEnabled || entry.HealthProbeIntervalSeconds != 17 {
+		t.Fatalf("updated entry = %#v", entry)
+	}
+	saved, errLoad := config.LoadConfig(h.configFilePath)
+	if errLoad != nil {
+		t.Fatalf("load saved config: %v", errLoad)
+	}
+	if len(saved.OpenAICompatibility) != 1 || !saved.OpenAICompatibility[0].HealthProbeEnabled || saved.OpenAICompatibility[0].HealthProbeIntervalSeconds != 17 {
+		t.Fatalf("saved entry = %#v", saved.OpenAICompatibility)
+	}
+}
+
 func TestPatchGeminiKeyUpdatesPriority(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

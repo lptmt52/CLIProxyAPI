@@ -67,6 +67,18 @@ func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
 	expectContains(t, changes, "provider removed: provider-a (api-keys=1, models=1)")
 }
 
+func TestDiffOpenAICompatibility_HealthProbeFields(t *testing.T) {
+	oldList := []config.OpenAICompatibility{{Name: "provider-a"}}
+	newList := []config.OpenAICompatibility{{
+		Name:                       "provider-a",
+		HealthProbeEnabled:         true,
+		HealthProbeIntervalSeconds: 17,
+	}}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (health-probe-enabled false -> true, health-probe-interval-seconds 0 -> 17)")
+}
+
 func TestOpenAICompatKeyFallbacks(t *testing.T) {
 	entry := config.OpenAICompatibility{
 		BaseURL: "http://base",

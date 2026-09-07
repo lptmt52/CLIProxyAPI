@@ -676,6 +676,13 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// HealthProbeEnabled starts a provider-specific recovery probe loop. The flag is
+	// cleared automatically after the provider responds successfully.
+	HealthProbeEnabled bool `yaml:"health-probe-enabled,omitempty" json:"health-probe-enabled,omitempty"`
+
+	// HealthProbeIntervalSeconds controls the delay between recovery probes.
+	HealthProbeIntervalSeconds int `yaml:"health-probe-interval-seconds,omitempty" json:"health-probe-interval-seconds,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -1027,6 +1034,9 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
+		if e.HealthProbeIntervalSeconds < 0 {
+			e.HealthProbeIntervalSeconds = 0
+		}
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue

@@ -485,15 +485,17 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Label         *string                             `json:"label"`
-		Priority      *int                                `json:"priority"`
-		Prefix        *string                             `json:"prefix"`
-		Disabled      *bool                               `json:"disabled"`
-		BaseURL       *string                             `json:"base-url"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		Name                       *string                             `json:"name"`
+		Label                      *string                             `json:"label"`
+		Priority                   *int                                `json:"priority"`
+		Prefix                     *string                             `json:"prefix"`
+		Disabled                   *bool                               `json:"disabled"`
+		BaseURL                    *string                             `json:"base-url"`
+		APIKeyEntries              *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models                     *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers                    *map[string]string                  `json:"headers"`
+		HealthProbeEnabled         *bool                               `json:"health-probe-enabled"`
+		HealthProbeIntervalSeconds *int                                `json:"health-probe-interval-seconds"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -559,6 +561,12 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.HealthProbeEnabled != nil {
+		entry.HealthProbeEnabled = *body.Value.HealthProbeEnabled
+	}
+	if body.Value.HealthProbeIntervalSeconds != nil {
+		entry.HealthProbeIntervalSeconds = *body.Value.HealthProbeIntervalSeconds
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
 	h.cfg.OpenAICompatibility[targetIndex] = entry

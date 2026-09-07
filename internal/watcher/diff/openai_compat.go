@@ -69,6 +69,12 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	if oldEntry.Disabled != newEntry.Disabled {
 		details = append(details, fmt.Sprintf("disabled %t -> %t", oldEntry.Disabled, newEntry.Disabled))
 	}
+	if oldEntry.HealthProbeEnabled != newEntry.HealthProbeEnabled {
+		details = append(details, fmt.Sprintf("health-probe-enabled %t -> %t", oldEntry.HealthProbeEnabled, newEntry.HealthProbeEnabled))
+	}
+	if oldEntry.HealthProbeIntervalSeconds != newEntry.HealthProbeIntervalSeconds {
+		details = append(details, fmt.Sprintf("health-probe-interval-seconds %d -> %d", oldEntry.HealthProbeIntervalSeconds, newEntry.HealthProbeIntervalSeconds))
+	}
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
 	}

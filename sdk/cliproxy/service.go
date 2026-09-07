@@ -106,6 +106,12 @@ type Service struct {
 	homeClient       *home.Client
 	homeCancel       context.CancelFunc
 	homeLogForwarder *logging.HomeAppLogForwarder
+
+	providerHealthMu         sync.Mutex
+	providerHealthCtx        context.Context
+	providerHealthCancel     context.CancelFunc
+	providerHealthProbes     map[string]providerHealthProbe
+	providerHealthGeneration uint64
 }
 
 const modelRegistrationMaxWorkersPerCategory = 5
@@ -1121,6 +1127,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	ctx := context.Background()
 	s.registerConfigAPIKeyAuths(ctx, newCfg)
 	s.syncPluginRuntime(ctx)
+	s.reconcileProviderHealthProbes()
 }
 
 func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Config) {
@@ -1501,6 +1508,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	s.startProviderHealthProbes(ctx)
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {
@@ -1556,6 +1564,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.watcherCancel != nil {
 			s.watcherCancel()
 		}
+		s.stopProviderHealthProbes()
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 		}

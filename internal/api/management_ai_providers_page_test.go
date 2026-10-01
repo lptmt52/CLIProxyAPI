@@ -40,7 +40,7 @@ func TestInjectManagementAIProvidersEntry(t *testing.T) {
 			`window.addEventListener("cliproxy-route-change", handleRouteChange);`,
 			`["pushState", "replaceState"].forEach(function (method)`,
 			`scheduleRouteReload();`,
-			`value: { priority: next }`,
+			`patchRecord(record, { priority: next })`,
 			`showToast(`,
 			`api.__cliproxyProviderPutWrapped`,
 			`loadRecords(true);`,

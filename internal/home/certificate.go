@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 const homeCertificateRequestTimeout = 30 * time.Second
@@ -65,6 +65,7 @@ func ConfigFromJWT(ctx context.Context, rawJWT string) (config.HomeConfig, error
 	}
 	return config.HomeConfig{
 		Enabled: true,
+		NodeID:  strings.TrimSpace(claims.CertificateID),
 		Host:    strings.TrimSpace(claims.IP),
 		Port:    claims.Port,
 		TLS: config.HomeTLSConfig{

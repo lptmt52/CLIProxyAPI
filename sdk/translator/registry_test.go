@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/tidwall/gjson"
 )
 
@@ -59,6 +60,21 @@ func hasCall(calls []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestHasPluginHooks(t *testing.T) {
+	registry := NewRegistry()
+	if registry.HasPluginHooks() {
+		t.Fatal("new registry unexpectedly reports plugin hooks")
+	}
+	registry.SetPluginHooks(&fakePluginHooks{})
+	if !registry.HasPluginHooks() {
+		t.Fatal("registry did not report installed plugin hooks")
+	}
+	registry.SetPluginHooks(nil)
+	if registry.HasPluginHooks() {
+		t.Fatal("registry still reports cleared plugin hooks")
+	}
 }
 
 func TestTranslateRequest_FallbackNormalizesModel(t *testing.T) {
@@ -164,6 +180,70 @@ func TestHasRequestTransformer(t *testing.T) {
 	}
 }
 
+func TestHasResponseTransformerIgnoresEmptyRegistration(t *testing.T) {
+	r := NewRegistry()
+	from := Format("from")
+	to := Format("to")
+
+	r.Register(from, to, func(model string, rawJSON []byte, stream bool) []byte {
+		return rawJSON
+	}, ResponseTransform{})
+
+	if r.HasResponseTransformer(from, to) {
+		t.Fatal("empty response transform was reported as a response transformer")
+	}
+	if r.HasStreamResponseTransformer(from, to) {
+		t.Fatal("empty response transform was reported as a stream response transformer")
+	}
+	if r.HasNonStreamResponseTransformer(from, to) {
+		t.Fatal("empty response transform was reported as a non-stream response transformer")
+	}
+}
+
+func TestHasResponseTransformerChecksConcreteResponseKinds(t *testing.T) {
+	ctx := context.Background()
+	r := NewRegistry()
+	from := Format("from")
+	streamOnlyTo := Format("stream-to")
+	nonStreamOnlyTo := Format("non-stream-to")
+
+	r.Register(from, streamOnlyTo, nil, ResponseTransform{
+		Stream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+			return [][]byte{rawJSON}
+		},
+	})
+	r.Register(from, nonStreamOnlyTo, nil, ResponseTransform{
+		NonStream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+			return rawJSON
+		},
+	})
+
+	if !r.HasResponseTransformer(from, streamOnlyTo) {
+		t.Fatal("stream response transform was not reported as a response transformer")
+	}
+	if !r.HasStreamResponseTransformer(from, streamOnlyTo) {
+		t.Fatal("stream response transform was not reported as a stream response transformer")
+	}
+	if r.HasNonStreamResponseTransformer(from, streamOnlyTo) {
+		t.Fatal("stream-only transform was reported as a non-stream response transformer")
+	}
+
+	if !r.HasResponseTransformer(from, nonStreamOnlyTo) {
+		t.Fatal("non-stream response transform was not reported as a response transformer")
+	}
+	if r.HasStreamResponseTransformer(from, nonStreamOnlyTo) {
+		t.Fatal("non-stream-only transform was reported as a stream response transformer")
+	}
+	if !r.HasNonStreamResponseTransformer(from, nonStreamOnlyTo) {
+		t.Fatal("non-stream response transform was not reported as a non-stream response transformer")
+	}
+
+	got := r.TranslateStream(ctx, streamOnlyTo, from, "model", nil, nil, []byte(`data: {"ok":true}`), nil)
+	if len(got) != 1 || string(got[0]) != `data: {"ok":true}` {
+		t.Fatalf("stream transform output = %q", got)
+	}
+}
+
 func TestTranslateRequest_PluginTranslatorOnlyWhenNativeMissing(t *testing.T) {
 	from := Format("from")
 	to := Format("to")
@@ -243,6 +323,99 @@ func TestTranslateNonStream_PluginTranslatorOnlyWhenNativeMissing(t *testing.T) 
 	}
 }
 
+func TestTranslateStream_NativeEmptyOutputSuppressesRawFallback(t *testing.T) {
+	ctx := context.Background()
+	from := Format("client")
+	to := Format("upstream")
+
+	r := NewRegistry()
+	r.Register(to, from, nil, ResponseTransform{
+		Stream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+			return nil
+		},
+	})
+
+	got := r.TranslateStream(ctx, from, to, "model", nil, nil, []byte(`data: {"raw":true}`), nil)
+	if len(got) != 0 {
+		t.Fatalf("native stream transformer returned empty output, got raw fallback %q", got)
+	}
+}
+
+func TestTranslateStream_PluginTranslatorUsedWhenNativeStreamMissing(t *testing.T) {
+	ctx := context.Background()
+	from := Format("client")
+	to := Format("upstream")
+
+	r := NewRegistry()
+	hooks := &fakePluginHooks{
+		responseTranslateBody: []byte(`data: {"plugin":true}`),
+		responseTranslateOK:   true,
+	}
+	r.SetPluginHooks(hooks)
+	r.Register(to, from, nil, ResponseTransform{
+		NonStream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+			return []byte(`{"native-non-stream":true}`)
+		},
+	})
+
+	got := r.TranslateStream(ctx, from, to, "model", nil, nil, []byte(`data: {"raw":true}`), nil)
+	if len(got) != 1 || string(got[0]) != `data: {"plugin":true}` {
+		t.Fatalf("plugin stream translator was not used, got %q", got)
+	}
+	if !hasCall(hooks.calls, "translate-response") {
+		t.Fatal("plugin response translator was not called when native stream transformer was missing")
+	}
+}
+
+func TestRequestEnvelopePreservesRegisteredTransformDispatch(t *testing.T) {
+	r := NewRegistry()
+	from := FormatOpenAIResponse
+	to := FormatAntigravity
+	modelInfo := &registry.ModelInfo{ID: "home-model"}
+
+	r.RegisterRequestEnvelope(from, to, func(_ context.Context, req RequestEnvelope) RequestEnvelope {
+		if req.ModelInfo == nil {
+			req.Body = []byte(`{"source":"native"}`)
+		} else {
+			req.Body = []byte(`{"source":"model-info"}`)
+		}
+		return req
+	})
+
+	withoutMetadata := r.TranslateRequest(from, to, "home-model", []byte(`{"input":"hello"}`), false)
+	if gjson.GetBytes(withoutMetadata, "source").String() != "native" {
+		t.Fatalf("without metadata used unexpected transform: %s", withoutMetadata)
+	}
+	withMetadata, err := NewPipeline(r).TranslateRequest(context.Background(), from, to, RequestEnvelope{
+		Format: from, Model: "home-model", Body: []byte(`{"input":"hello"}`), ModelInfo: modelInfo,
+	})
+	if err != nil {
+		t.Fatalf("pipeline translation failed: %v", err)
+	}
+	if gjson.GetBytes(withMetadata.Body, "source").String() != "model-info" {
+		t.Fatalf("envelope metadata was not used: %s", withMetadata.Body)
+	}
+	if withMetadata.ModelInfo != modelInfo {
+		t.Fatal("pipeline did not preserve request-scoped model info")
+	}
+
+	// A custom registration replaces the envelope-aware native route.
+	r.Register(from, to, func(string, []byte, bool) []byte {
+		return []byte(`{"source":"custom"}`)
+	}, ResponseTransform{})
+	for _, payload := range [][]byte{
+		[]byte(`{"input":"hello"}`),
+		[]byte(`{"input":"weather","tools":[{"type":"web_search"}]}`),
+	} {
+		customWithMetadata := r.TranslateRequestEnvelope(context.Background(), from, to, RequestEnvelope{
+			Format: from, Model: "home-model", Body: payload, ModelInfo: modelInfo,
+		})
+		if gjson.GetBytes(customWithMetadata.Body, "source").String() != "custom" {
+			t.Fatalf("request metadata bypassed custom transform for %s: %s", payload, customWithMetadata.Body)
+		}
+	}
+}
+
 func TestPluginNormalizersChainAfterNative(t *testing.T) {
 	ctx := context.Background()
 	r := NewRegistry()
@@ -292,5 +465,38 @@ func TestPluginNormalizersChainAfterNative(t *testing.T) {
 	}
 	if hasCall(hooks.calls, "translate-request") || hasCall(hooks.calls, "translate-response") {
 		t.Fatalf("plugin translators should not run when native transformers exist, calls=%v", hooks.calls)
+	}
+}
+
+func TestUnregisterRestoresFormatPair(t *testing.T) {
+	from := Format("unregister-default-from")
+	to := Format("unregister-default-to")
+	other := Format("unregister-default-other")
+	if HasRequestTransformer(from, to) || HasRequestTransformer(from, other) {
+		t.Fatal("test formats are already registered")
+	}
+	identity := func(_ string, rawJSON []byte, _ bool) []byte {
+		return append([]byte(nil), rawJSON...)
+	}
+	Register(from, to, identity, ResponseTransform{
+		NonStream: func(context.Context, string, []byte, []byte, []byte, *any) []byte {
+			return []byte(`{"removed":true}`)
+		},
+	})
+	Register(from, other, identity, ResponseTransform{})
+	t.Cleanup(func() {
+		Unregister(from, to)
+		Unregister(from, other)
+	})
+
+	if !HasRequestTransformer(from, to) || !HasNonStreamResponseTransformer(from, to) || !HasRequestTransformer(from, other) {
+		t.Fatal("register did not store transforms")
+	}
+	Unregister(from, to)
+	if HasRequestTransformer(from, to) || HasNonStreamResponseTransformer(from, to) || HasResponseTransformer(from, to) {
+		t.Fatal("unregister left transforms behind")
+	}
+	if !HasRequestTransformer(from, other) {
+		t.Fatal("unregister removed a different format pair")
 	}
 }

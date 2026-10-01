@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestListAuthFiles_FiltersUnauthorizedAndPaginates(t *testing.T) {
@@ -62,7 +62,7 @@ func TestListAuthFiles_FiltersUnauthorizedAndPaginates(t *testing.T) {
 	ginCtx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(
 		http.MethodGet,
-		"/v0/management/auth-files?provider=codex&status_code=401&page=1&page_size=1",
+		"/v8/management/credentials?provider=codex&status_code=401&page=1&page_size=1",
 		nil,
 	)
 	ginCtx.Request = req
@@ -92,10 +92,7 @@ func TestListAuthFiles_FiltersUnauthorizedAndPaginates(t *testing.T) {
 		t.Fatalf("expected last_error_status_code=%d, got %d", http.StatusUnauthorized, got)
 	}
 
-	pagination, ok := payload["pagination"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected pagination object, payload: %#v", payload)
-	}
+	pagination := payload
 	if got := int(pagination["total"].(float64)); got != 2 {
 		t.Fatalf("expected pagination total=2, got %d", got)
 	}
@@ -143,7 +140,7 @@ func TestPatchAuthFileStatus_FilterBatch(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", strings.NewReader(`{"provider":"codex","status_code":401,"disabled":true}`))
+	req := httptest.NewRequest(http.MethodPatch, "/v8/management/credentials/status", strings.NewReader(`{"provider":"codex","status_code":401,"disabled":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	ctx.Request = req
 
@@ -201,7 +198,7 @@ func TestDeleteAuthFile_FilterBatchQuery(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(rec)
 	req := httptest.NewRequest(
 		http.MethodDelete,
-		"/v0/management/auth-files?provider=codex&status_code=401&unauthorized=true",
+		"/v8/management/credentials?provider=codex&status_code=401&unauthorized=true",
 		nil,
 	)
 	ctx.Request = req

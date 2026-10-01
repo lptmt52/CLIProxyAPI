@@ -19,6 +19,9 @@ func injectManagementQuotaActionsEntry(data []byte) []byte {
 }
 
 func patchManagementQuotaPageBundle(html string) string {
+	if strings.Contains(html, "/v8/management") {
+		return patchManagementQuotaV8Page(html)
+	}
 	// The upstream panel is a minified bundle. Keep this scoped to its stable quota page markers.
 	html = strings.Replace(html, ",[p,m]=(0,y.useState)(1),h=Yb()", ",[p,m]=(0,y.useState)(1),[q,qq]=(0,y.useState)(50),h=Yb()", 1)
 	html = strings.Replace(html, "$M(M,p,20)", "$M(M,p,q)", 1)
@@ -115,8 +118,8 @@ const managementQuotaActionsEntryScript = `<script id="cliproxy-quota-actions-en
     busy = true;
     Array.prototype.forEach.call(actions.querySelectorAll("button"), function (button) { button.disabled = true; });
     var request = kind === "delete"
-      ? client.delete("/auth-files", {data: {names: [name]}})
-      : client.patch("/auth-files/status", {name: name, disabled: true});
+      ? client.delete("/credentials", {data: {names: [name]}})
+      : client.patch("/credentials/status", {name: name, disabled: true});
     Promise.resolve(request).then(function () {
       if (kind === "delete") {
         card.remove();

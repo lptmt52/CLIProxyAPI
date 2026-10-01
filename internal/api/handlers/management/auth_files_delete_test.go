@@ -11,13 +11,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
 	authDir := filepath.Join(tempDir, "auth")
@@ -101,7 +100,6 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	fileName := "fallback-user.json"
@@ -130,7 +128,6 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 
 func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	fileName := "runtime-remove-user.json"

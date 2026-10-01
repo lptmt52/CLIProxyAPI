@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Server) serveManagementTokenUsagePage(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.getConfig()
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
@@ -526,7 +526,7 @@ const managementTokenUsageHTML = `<!doctype html>
   <script>
     (function () {
       var storageKey = "cliproxy.tokenUsage.managementKey";
-      var apiPath = "/v0/management/token-usage";
+      var apiPath = "/v8/management/observability/usage/token-usage";
       var formatter = new Intl.NumberFormat("zh-CN");
       var key = findInitialKey();
 

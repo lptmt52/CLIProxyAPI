@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestRegisterCommandLineFlagsSkipsNativeAndUsesPriority(t *testing.T) {
@@ -127,16 +127,16 @@ func TestExecuteCommandLinePersistsReturnedAuths(t *testing.T) {
 		response: pluginapi.CommandLineExecutionResponse{
 			Stdout: []byte("login ok\n"),
 			Auths: []pluginapi.AuthData{{
-				Provider:    "Qoder",
-				ID:          "qoder.json",
-				FileName:    "qoder.json",
+				Provider:    "Sample-Provider",
+				ID:          "sample-provider.json",
+				FileName:    "sample-provider.json",
 				Label:       "Luis",
 				StorageJSON: []byte(`{"token":"secret"}`),
 			}},
 		},
 	}
 	host := newHostWithRecords(capabilityRecord{
-		id:     "qoder",
+		id:     "sample-provider",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{CommandLinePlugin: plugin}},
 	})
 	host.runtimeConfig = &config.Config{AuthDir: authDir}
@@ -160,13 +160,13 @@ func TestExecuteCommandLinePersistsReturnedAuths(t *testing.T) {
 		t.Fatalf("saved auths = %d, want 1", len(store.saved))
 	}
 	saved := store.saved[0]
-	if saved.Provider != "qoder" || saved.ID != "qoder.json" || saved.FileName != "qoder.json" {
-		t.Fatalf("saved auth = %#v, want normalized qoder auth", saved)
+	if saved.Provider != "sample-provider" || saved.ID != "sample-provider.json" || saved.FileName != "sample-provider.json" {
+		t.Fatalf("saved auth = %#v, want normalized sample provider auth", saved)
 	}
 	if saved.Storage == nil {
 		t.Fatal("saved auth storage = nil, want plugin token storage")
 	}
-	if store.paths[0] != filepath.Join(authDir, "qoder.json") {
+	if store.paths[0] != filepath.Join(authDir, "sample-provider.json") {
 		t.Fatalf("saved path = %q, want auth dir path", store.paths[0])
 	}
 }

@@ -6,10 +6,10 @@ package cliproxy
 import (
 	"context"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // TokenClientProvider loads clients backed by stored authentication tokens.
@@ -52,7 +52,8 @@ type APIKeyClientProvider interface {
 
 // APIKeyClientResult is returned by APIKeyClientProvider.Load()
 type APIKeyClientResult struct {
-	// GeminiKeyCount is the number of Gemini API keys loaded
+	// GeminiKeyCount is the number of Gemini-family API keys loaded.
+	// It includes native Interactions API keys.
 	GeminiKeyCount int
 
 	// VertexCompatKeyCount is the number of Vertex-compatible API keys loaded
@@ -63,6 +64,12 @@ type APIKeyClientResult struct {
 
 	// CodexKeyCount is the number of Codex API keys loaded
 	CodexKeyCount int
+
+	// XAIKeyCount is the number of xAI API keys loaded
+	XAIKeyCount int
+
+	// MetaKeyCount is the number of Meta API keys loaded
+	MetaKeyCount int
 
 	// OpenAICompatCount is the number of OpenAI compatibility API keys loaded
 	OpenAICompatCount int
@@ -86,17 +93,25 @@ type PluginAuthParser interface {
 	ParseAuth(context.Context, pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error)
 }
 
+// PluginMultiAuthParser expands one auth JSON payload into multiple plugin auth records.
+// Returning handled=true with an empty slice means the plugin intentionally suppresses built-in parsing.
+type PluginMultiAuthParser interface {
+	ParseAuths(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error)
+}
+
 // WatcherWrapper exposes the subset of watcher methods required by the SDK.
 type WatcherWrapper struct {
 	start func(ctx context.Context) error
 	stop  func() error
 
-	setConfig             func(cfg *config.Config)
-	snapshotAuths         func() []*coreauth.Auth
-	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
-	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
-	dispatchPersistedAuth func(update watcher.AuthUpdate) bool
-	setPluginAuthParser   func(parser PluginAuthParser)
+	setConfig                    func(cfg *config.Config)
+	snapshotAuths                func() []*coreauth.Auth
+	setUpdateQueue               func(queue chan<- watcher.AuthUpdate)
+	dispatchRuntimeUpdate        func(update watcher.AuthUpdate) bool
+	dispatchPersistedAuth        func(update watcher.AuthUpdate) bool
+	dispatchPersistedAuthWithRev func(update *watcher.AuthUpdate) (bool, uint64)
+	setPluginAuthParser          func(parser PluginAuthParser)
+	reloadConfigIfChanged        func()
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -123,6 +138,15 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 	w.setConfig(cfg)
 }
 
+// ReloadConfigIfChanged asks the underlying watcher to reload config from disk.
+func (w *WatcherWrapper) ReloadConfigIfChanged() bool {
+	if w == nil || w.reloadConfigIfChanged == nil {
+		return false
+	}
+	w.reloadConfigIfChanged()
+	return true
+}
+
 // SetPluginAuthParser updates the plugin auth parser used by the watcher.
 func (w *WatcherWrapper) SetPluginAuthParser(parser PluginAuthParser) {
 	if w == nil || w.setPluginAuthParser == nil {
@@ -143,10 +167,33 @@ func (w *WatcherWrapper) DispatchRuntimeAuthUpdate(update watcher.AuthUpdate) bo
 
 // DispatchPersistedAuthUpdate forwards already-persisted file auth updates.
 func (w *WatcherWrapper) DispatchPersistedAuthUpdate(update watcher.AuthUpdate) bool {
-	if w == nil || w.dispatchPersistedAuth == nil {
+	if w == nil {
 		return false
 	}
-	return w.dispatchPersistedAuth(update)
+	if w.dispatchPersistedAuthWithRev != nil {
+		ok, _ := w.dispatchPersistedAuthWithRev(&update)
+		return ok
+	}
+	if w.dispatchPersistedAuth != nil {
+		return w.dispatchPersistedAuth(update)
+	}
+	return false
+}
+
+// DispatchPersistedAuthUpdateWithRevision forwards already-persisted file auth updates
+// and returns whether it was enqueued along with its assigned watcher revision.
+func (w *WatcherWrapper) DispatchPersistedAuthUpdateWithRevision(update *watcher.AuthUpdate) (bool, uint64) {
+	if w == nil {
+		return false, 0
+	}
+	if w.dispatchPersistedAuthWithRev != nil {
+		return w.dispatchPersistedAuthWithRev(update)
+	}
+	if w.dispatchPersistedAuth != nil && update != nil {
+		ok := w.dispatchPersistedAuth(*update)
+		return ok, update.Revision()
+	}
+	return false, 0
 }
 
 // SetClients updates the watcher file-backed clients registry.

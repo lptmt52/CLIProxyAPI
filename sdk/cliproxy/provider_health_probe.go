@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,6 +21,7 @@ const (
 )
 
 type providerHealthProbe struct {
+	done       <-chan struct{}
 	cancel     context.CancelFunc
 	signature  string
 	generation uint64
@@ -112,8 +113,9 @@ func (s *Service) reconcileProviderHealthProbes() {
 		ctx, cancel := context.WithCancel(s.providerHealthCtx)
 		s.providerHealthGeneration++
 		generation := s.providerHealthGeneration
-		s.providerHealthProbes[key] = providerHealthProbe{cancel: cancel, signature: signature, generation: generation}
-		go s.runProviderHealthProbe(ctx, key, provider, signature, generation)
+		done := make(chan struct{})
+		s.providerHealthProbes[key] = providerHealthProbe{cancel: cancel, signature: signature, generation: generation, done: done}
+		go func() { defer close(done); s.runProviderHealthProbe(ctx, key, provider, signature, generation) }()
 		log.Infof("provider health probe started: provider=%s interval=%s", provider.Name, healthProbeInterval(provider))
 	}
 }
@@ -312,7 +314,8 @@ func (s *Service) disableProviderHealthProbe(providerName, expectedSignature str
 		if changed {
 			s.cfgMu.Lock()
 			if s.cfg == cfg {
-				*cfg = updatedCfg
+				s.cfg = &updatedCfg
+				s.configSequence++
 			}
 			s.cfgMu.Unlock()
 			s.reconcileProviderHealthProbes()
@@ -324,7 +327,8 @@ func (s *Service) disableProviderHealthProbe(providerName, expectedSignature str
 	}
 	s.cfgMu.Lock()
 	if s.cfg == cfg {
-		*cfg = updatedCfg
+		s.cfg = &updatedCfg
+		s.configSequence++
 	}
 	s.cfgMu.Unlock()
 	s.reconcileProviderHealthProbes()

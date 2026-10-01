@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestProbeOpenAICompatibilityProvider(t *testing.T) {
@@ -71,7 +71,20 @@ func TestProviderHealthProbeSignatureChangesForProbeInputs(t *testing.T) {
 }
 
 func TestProviderHealthProbeDisablesAfterRecovery(t *testing.T) {
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -96,26 +109,20 @@ func TestProviderHealthProbeDisablesAfterRecovery(t *testing.T) {
 	s := &Service{cfg: cfg, configPath: configPath}
 	s.startProviderHealthProbes(ctx)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !cfg.OpenAICompatibility[0].HealthProbeEnabled {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	s.providerHealthMu.Lock()
+	done := s.providerHealthProbes["provider-a"].done
+	s.providerHealthMu.Unlock()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("health probe did not finish")
 	}
-	if cfg.OpenAICompatibility[0].HealthProbeEnabled {
-		t.Fatal("health probe remained enabled after successful recovery")
+	if s.currentConfig().OpenAICompatibility[0].HealthProbeEnabled {
+		t.Fatal("health probe remained enabled")
 	}
-
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		s.providerHealthMu.Lock()
-		probeCount := len(s.providerHealthProbes)
-		s.providerHealthMu.Unlock()
-		if probeCount == 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	if !cfg.OpenAICompatibility[0].HealthProbeEnabled {
+		t.Fatal("previous v8 config snapshot was mutated")
 	}
 	s.providerHealthMu.Lock()
 	probeCount := len(s.providerHealthProbes)

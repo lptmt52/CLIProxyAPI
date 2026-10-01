@@ -56,12 +56,12 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
   var clientMutationWrapped = false;
 
   var specs = [
-    { brand: "gemini", endpoint: "/gemini-api-key", field: "gemini-api-key" },
-    { brand: "codex", endpoint: "/codex-api-key", field: "codex-api-key" },
-    { brand: "xai", endpoint: "/xai-api-key", field: "xai-api-key" },
-    { brand: "claude", endpoint: "/claude-api-key", field: "claude-api-key" },
-    { brand: "vertex", endpoint: "/vertex-api-key", field: "vertex-api-key" },
-    { brand: "openaiCompatibility", endpoint: "/openai-compatibility", field: "openai-compatibility" }
+    { brand: "gemini", endpoint: "/config/api-keys/gemini", field: "gemini-api-key" },
+    { brand: "codex", endpoint: "/config/api-keys/codex", field: "codex-api-key" },
+    { brand: "xai", endpoint: "/config/api-keys/xai", field: "xai-api-key" },
+    { brand: "claude", endpoint: "/config/api-keys/claude", field: "claude-api-key" },
+    { brand: "vertex", endpoint: "/config/api-keys/vertex", field: "vertex-api-key" },
+    { brand: "openaiCompatibility", endpoint: "/config/api-keys/openai-compatibility", field: "openai-compatibility" }
   ];
 
   function currentRoute() {
@@ -153,7 +153,18 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
   }
 
   function recordsFromResponse(spec, response) {
-    var values = response && response[spec.field];
+    var values = [];
+    if (Array.isArray(response)) {
+      response.forEach(function (group) {
+        if (spec.brand === "openaiCompatibility") {
+          values.push(Object.assign({}, group, {"api-key-entries": group.keys, _groupName: group.name}));
+        } else {
+          (group.keys || []).forEach(function (key) {
+            values.push(Object.assign({}, group, key, {_groupName: group.name}));
+          });
+        }
+      });
+    }
     if (!Array.isArray(values)) return [];
     return values.map(function (item, index) {
       item = item && typeof item === "object" ? item : {};
@@ -170,6 +181,7 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
       return {
         brand: spec.brand,
         endpoint: spec.endpoint,
+        groupName: item._groupName,
         index: index,
         name: String(item.name || "").trim(),
         key: keys[0] || "",
@@ -179,6 +191,24 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
         label: String(item.label || "").trim(),
         priority: priority
       };
+    });
+  }
+
+  function patchRecord(record, value) {
+    var api = client();
+    return api.get(record.endpoint).then(function (groups) {
+      if (!Array.isArray(groups)) throw new Error("Invalid provider groups");
+      var matches = [];
+      groups.forEach(function (group) {
+        if (String(group.name || "") !== String(record.groupName || "") || String(group["base-url"] || "").trim() !== record.baseUrl) return;
+        if (record.brand === "openaiCompatibility") matches.push(group);
+        else (group.keys || []).forEach(function (key) {
+          if (String(key["api-key"] || "").trim() === record.key) matches.push(key);
+        });
+      });
+      if (matches.length !== 1) throw new Error("Provider configuration changed; refresh before editing");
+      Object.assign(matches[0], value);
+      return api.put(record.endpoint, groups);
     });
   }
 
@@ -371,10 +401,7 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
       var api = client();
       if (!api || typeof api.patch !== "function") return;
       label.disabled = true;
-      api.patch(record.endpoint, {
-        index: record.index,
-        value: { label: next }
-      }).then(function () {
+      patchRecord(record, { label: next }).then(function () {
         record.label = next;
         label.textContent = next || defaultLabel;
       }).catch(function (error) {
@@ -478,10 +505,7 @@ const managementAIProvidersEntryScript = `<script id="cliproxy-ai-providers-entr
     var previous = record.priority;
     record.prioritySaving = true;
     input.disabled = true;
-    api.patch(record.endpoint, {
-      index: record.index,
-      value: { priority: next }
-    }).then(function () {
+    patchRecord(record, { priority: next }).then(function () {
       record.priority = next;
       input.value = String(next);
       showToast("\u4f18\u5148\u7ea7\u5df2\u4fdd\u5b58", "success");

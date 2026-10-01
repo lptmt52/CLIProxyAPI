@@ -3,7 +3,7 @@ package pluginhost
 import (
 	"context"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 const pluginHostABIVersion = pluginabi.ABIVersion
@@ -14,5 +14,5 @@ type pluginClient interface {
 }
 
 type pluginLoader interface {
-	Open(path string, host *Host) (pluginClient, error)
+	Open(file pluginFile, host *Host) (pluginClient, error)
 }

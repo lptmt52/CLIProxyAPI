@@ -16,6 +16,8 @@ import "C"
 import (
 	"context"
 	"unsafe"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 )
 
 //export cliproxyHostCall
@@ -32,17 +34,18 @@ func cliproxyHostCall(hostCtx unsafe.Pointer, method *C.char, request *C.uint8_t
 	if !okHost {
 		return 1
 	}
-	host, okHost := rawHost.(*Host)
-	if !okHost || host == nil {
+	entry, okHost := rawHost.(dynamicHostCallbackEntry)
+	if !okHost || entry.host == nil {
 		return 1
 	}
 	var requestBytes []byte
 	if request != nil && requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	resp, errCall := host.callFromPlugin(context.Background(), C.GoString(method), requestBytes)
+	ctx := withHostCallbackIdentity(context.Background(), entry.pluginID, entry.instance)
+	resp, errCall := entry.host.callFromPlugin(ctx, C.GoString(method), requestBytes)
 	if errCall != nil {
-		resp = marshalRPCError("host_call_failed", errCall.Error())
+		resp = marshalRPCError("host_call_failed", errCall.Error(), clienterror.HTTPStatusFromError(errCall))
 	}
 	if len(resp) == 0 || response == nil {
 		return 0

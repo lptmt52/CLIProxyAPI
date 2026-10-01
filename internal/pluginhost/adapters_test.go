@@ -7,19 +7,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T) {
@@ -74,6 +77,32 @@ func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T)
 		got.SupportedInputModalities[0] != "text" || got.SupportedOutputModalities[0] != "image" ||
 		got.Thinking.Levels[0] != "low" {
 		t.Fatalf("converted model kept aliases to plugin slices: %#v", got)
+	}
+}
+
+func TestExecutorNativeStreamResponseTranslatorExistsRequiresStreamTransform(t *testing.T) {
+	outputFormat := sdktranslator.Format("plugin-output-non-stream-only")
+	requestedFormat := sdktranslator.Format("client-output-non-stream-only")
+	sdktranslator.Register(requestedFormat, outputFormat, nil, sdktranslator.ResponseTransform{
+		NonStream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+			return rawJSON
+		},
+	})
+
+	if executorNativeStreamResponseTranslatorExists(outputFormat, requestedFormat) {
+		t.Fatal("non-stream-only response transformer was accepted for stream executor output")
+	}
+
+	streamOutputFormat := sdktranslator.Format("plugin-output-stream")
+	streamRequestedFormat := sdktranslator.Format("client-output-stream")
+	sdktranslator.Register(streamRequestedFormat, streamOutputFormat, nil, sdktranslator.ResponseTransform{
+		Stream: func(ctx context.Context, model string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+			return [][]byte{rawJSON}
+		},
+	})
+
+	if !executorNativeStreamResponseTranslatorExists(streamOutputFormat, streamRequestedFormat) {
+		t.Fatal("stream response transformer was not accepted for stream executor output")
 	}
 }
 
@@ -270,12 +299,12 @@ func TestRegisterModelsPrunesStaleClientAfterSnapshotChange(t *testing.T) {
 	})
 	host.RegisterModels(context.Background(), modelRegistry)
 
-	host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+	setHostSnapshotForTest(host, true, capabilityRecord{
 		id: "bravo",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
 			ModelRegistrar: staticModelRegistrar("provider-b", "model-b"),
 		}},
-	}}})
+	})
 	host.RegisterModels(context.Background(), modelRegistry)
 
 	if _, okClient := modelRegistry.clients["plugin:alpha:provider-a"]; okClient {
@@ -292,16 +321,16 @@ func TestRegisterModelsPrunesStaleClientAfterSnapshotChange(t *testing.T) {
 func TestRegisterModelsDropsResultsWhenSnapshotChangesDuringRegistration(t *testing.T) {
 	modelRegistry := newFakeModelRegistry()
 	host := New()
-	oldSnap := &Snapshot{enabled: true, records: []capabilityRecord{{
+	oldRecord := capabilityRecord{
 		id: "alpha",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
 			ModelRegistrar: modelRegistrarFunc(func(ctx context.Context, req pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
-				host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+				setHostSnapshotForTest(host, true, capabilityRecord{
 					id: "bravo",
 					plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
 						ModelRegistrar: staticModelRegistrar("provider-b", "model-b"),
 					}},
-				}}})
+				})
 				return pluginapi.ModelRegistrationResponse{
 					Provider: "provider-a",
 					Models: []pluginapi.ModelInfo{{
@@ -310,8 +339,8 @@ func TestRegisterModelsDropsResultsWhenSnapshotChangesDuringRegistration(t *test
 				}, nil
 			}),
 		}},
-	}}}
-	host.snapshot.Store(oldSnap)
+	}
+	setHostSnapshotForTest(host, true, oldRecord)
 	host.modelProviders["alpha"] = "existing-provider"
 
 	host.RegisterModels(context.Background(), modelRegistry)
@@ -596,25 +625,25 @@ func TestRegisterExecutorsOAuthScopeSkipsStaticModelClientButRegistersExecutor(t
 	manager := newFakeExecutorManager()
 	staticCalled := false
 	host := newHostWithRecords(capabilityRecord{
-		id: "qoder",
+		id: "sample-provider",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			AuthProvider: fakeAuthProvider{identifier: "qoder"},
+			AuthProvider: fakeAuthProvider{identifier: "sample-provider"},
 			ModelProvider: modelProviderFunc{
 				staticModels: func(ctx context.Context, req pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
 					staticCalled = true
 					return pluginapi.ModelResponse{
-						Provider: "qoder",
+						Provider: "sample-provider",
 						Models:   []pluginapi.ModelInfo{{ID: "static-model"}},
 					}, nil
 				},
 				modelsForAuth: func(ctx context.Context, req pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
 					return pluginapi.ModelResponse{
-						Provider: "qoder",
+						Provider: "sample-provider",
 						Models:   []pluginapi.ModelInfo{{ID: "oauth-model"}},
 					}, nil
 				},
 			},
-			Executor:           &fakeExecutor{identifier: "qoder"},
+			Executor:           &fakeExecutor{identifier: "sample-provider"},
 			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
 		}},
 	})
@@ -625,21 +654,21 @@ func TestRegisterExecutorsOAuthScopeSkipsStaticModelClientButRegistersExecutor(t
 	if staticCalled {
 		t.Fatal("StaticModels was called for an OAuth-only executor")
 	}
-	if _, okExecutor := manager.executors["qoder"]; !okExecutor {
+	if _, okExecutor := manager.executors["sample-provider"]; !okExecutor {
 		t.Fatal("OAuth-only executor was not registered")
 	}
-	if _, okClient := modelRegistry.clients[pluginExecutorModelClientID("qoder", "qoder")]; okClient {
+	if _, okClient := modelRegistry.clients[pluginExecutorModelClientID("sample-provider", "sample-provider")]; okClient {
 		t.Fatal("OAuth-only executor registered a static model client")
 	}
-	if got := host.ModelsForProvider("qoder"); len(got) != 0 {
+	if got := host.ModelsForProvider("sample-provider"); len(got) != 0 {
 		t.Fatalf("OAuth-only provider models = %#v, want none", got)
 	}
 
 	result := host.ModelsForAuth(context.Background(), &coreauth.Auth{
-		ID:       "qoder-auth",
-		Provider: "qoder",
+		ID:       "sample-provider-auth",
+		Provider: "sample-provider",
 	})
-	if !result.Handled || result.Provider != "qoder" || len(result.Models) != 1 || result.Models[0].ID != "oauth-model" {
+	if !result.Handled || result.Provider != "sample-provider" || len(result.Models) != 1 || result.Models[0].ID != "oauth-model" {
 		t.Fatalf("OAuth model result = %#v, want oauth-model", result)
 	}
 }
@@ -778,17 +807,17 @@ func TestRegisterExecutorsDropsResultsWhenSnapshotChangesBeforeCommit(t *testing
 		identifierFunc: func() string {
 			if !changedSnapshot {
 				changedSnapshot = true
-				host.snapshot.Store(&Snapshot{enabled: true})
+				setHostSnapshotForTest(host, true)
 			}
 			return "provider-a"
 		},
 	}
-	host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+	setHostSnapshotForTest(host, true, capabilityRecord{
 		id: "alpha",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
 			Executor: exec,
 		}},
-	}}})
+	})
 
 	host.RegisterExecutors(manager, nil)
 
@@ -874,6 +903,23 @@ func TestRegisterExecutorsPrunesStaleProviderAfterMigration(t *testing.T) {
 	}
 	if _, okClient := modelRegistry.clients[pluginExecutorModelClientID("alpha", "provider-b")]; !okClient {
 		t.Fatal("provider-b executor model client was not registered")
+	}
+}
+
+func TestOwnsExecutorDistinguishesHostAdapters(t *testing.T) {
+	host := New()
+	owned := &executorAdapter{host: host}
+	foreign := &executorAdapter{host: New()}
+	external := &fakeProviderExecutor{provider: "provider-a"}
+
+	if !host.OwnsExecutor(owned) {
+		t.Fatal("host did not recognize its executor adapter")
+	}
+	if host.OwnsExecutor(foreign) {
+		t.Fatal("host claimed another host's executor adapter")
+	}
+	if host.OwnsExecutor(external) {
+		t.Fatal("host claimed an externally owned executor")
 	}
 }
 
@@ -1086,7 +1132,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 			name:     "request translator",
 			pluginID: "request-translator-panic",
 			call: func(host *Host) ([]byte, bool) {
-				host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+				setHostSnapshotForTest(host, true, capabilityRecord{
 					id:       "request-translator-panic",
 					priority: 10,
 					plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
@@ -1094,7 +1140,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 							panic("request translator panic")
 						}),
 					}},
-				}}})
+				})
 				return host.TranslateRequest(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", []byte("body"), false)
 			},
 		},
@@ -1102,7 +1148,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 			name:     "response before normalizer",
 			pluginID: "response-before-panic",
 			call: func(host *Host) ([]byte, bool) {
-				host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+				setHostSnapshotForTest(host, true, capabilityRecord{
 					id:       "response-before-panic",
 					priority: 10,
 					plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
@@ -1110,7 +1156,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 							panic("response before panic")
 						}),
 					}},
-				}}})
+				})
 				return host.NormalizeResponseBefore(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", nil, nil, []byte("body"), false), false
 			},
 		},
@@ -1118,7 +1164,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 			name:     "response translator",
 			pluginID: "response-translator-panic",
 			call: func(host *Host) ([]byte, bool) {
-				host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+				setHostSnapshotForTest(host, true, capabilityRecord{
 					id:       "response-translator-panic",
 					priority: 10,
 					plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
@@ -1126,7 +1172,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 							panic("response translator panic")
 						}),
 					}},
-				}}})
+				})
 				return host.TranslateResponse(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", nil, nil, []byte("body"), false)
 			},
 		},
@@ -1134,7 +1180,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 			name:     "response after normalizer",
 			pluginID: "response-after-panic",
 			call: func(host *Host) ([]byte, bool) {
-				host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+				setHostSnapshotForTest(host, true, capabilityRecord{
 					id:       "response-after-panic",
 					priority: 10,
 					plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
@@ -1142,7 +1188,7 @@ func TestTranslatorPanicFusesEveryHookPath(t *testing.T) {
 							panic("response after panic")
 						}),
 					}},
-				}}})
+				})
 				return host.NormalizeResponseAfter(context.Background(), sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, "model", nil, nil, []byte("body"), false), false
 			},
 		},
@@ -1235,6 +1281,1003 @@ func TestTranslateResponseStopsAtFirstSuccessfulCandidate(t *testing.T) {
 	if fmt.Sprint(calls) != "[high]" {
 		t.Fatalf("calls = %v, want [high]", calls)
 	}
+}
+
+func TestInterceptRequestChainsByPriorityAndHeaders(t *testing.T) {
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "high",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					if req.SourceFormat != "openai" || req.Model != "normalized" || req.RequestedModel != "requested" {
+						t.Fatalf("unexpected request context: %#v", req)
+					}
+					return pluginapi.RequestInterceptResponse{
+						Headers: http.Header{"X-Plugin": []string{"high"}},
+						Body:    append(req.Body, []byte("|high")...),
+					}, nil
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "low",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{
+						Headers:      http.Header{"X-Plugin": []string{"low"}, "X-Low": []string{"1"}},
+						Body:         append(req.Body, []byte("|low")...),
+						ClearHeaders: []string{"X-Remove"},
+					}, nil
+				}),
+			}},
+		},
+	)
+	headers := http.Header{"X-Remove": []string{"yes"}}
+
+	got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		SourceFormat:   "openai",
+		Model:          "normalized",
+		RequestedModel: "requested",
+		Stream:         false,
+		Headers:        headers,
+		Body:           []byte("start"),
+	})
+
+	if string(got.Body) != "start|high|low" {
+		t.Fatalf("body = %q, want %q", got.Body, "start|high|low")
+	}
+	if got.Headers.Get("X-Plugin") != "low" || got.Headers.Get("X-Low") != "1" || got.Headers.Get("X-Remove") != "" {
+		t.Fatalf("headers = %#v", got.Headers)
+	}
+	if headers.Get("X-Plugin") != "" {
+		t.Fatalf("input headers were mutated: %#v", headers)
+	}
+}
+
+func TestInterceptRequestAfterAuthPassesTargetFormat(t *testing.T) {
+	host := newHostWithRecords(capabilityRecord{
+		id: "after",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				if req.SourceFormat != "openai" || req.ToFormat != "codex" {
+					t.Fatalf("request formats = %q -> %q, want openai -> codex", req.SourceFormat, req.ToFormat)
+				}
+				return pluginapi.RequestInterceptResponse{Body: append(req.Body, []byte("|after")...)}, nil
+			}),
+		}},
+	})
+
+	got := host.InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		SourceFormat: "openai",
+		ToFormat:     "codex",
+		Model:        "gpt-5.4",
+		Body:         []byte("body"),
+	})
+
+	if string(got.Body) != "body|after" {
+		t.Fatalf("body = %q, want body|after", got.Body)
+	}
+}
+
+func TestInterceptRequestPropagatesPath_Issue6196(t *testing.T) {
+	host := newHostWithRecords(capabilityRecord{
+		id: "path-rewriter",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				return pluginapi.RequestInterceptResponse{
+					Path: "/v1/images/generations",
+					Body: []byte(`{"model":"gpt-image-2.5"}`),
+				}, nil
+			}),
+		}},
+	})
+
+	got := host.InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		SourceFormat: "openai-image",
+		Model:        "gpt-image-2.5",
+		Body:         []byte(`{"model":"gpt-image-2.5"}`),
+	})
+
+	if got.Path != "/v1/images/generations" {
+		t.Fatalf("got.Path = %q, want /v1/images/generations", got.Path)
+	}
+	if string(got.Body) != `{"model":"gpt-image-2.5"}` {
+		t.Fatalf("got.Body = %s, want expected body", string(got.Body))
+	}
+}
+
+func TestInterceptRequestPropagatesPathAcrossPluginChain_Issue6196(t *testing.T) {
+	var secondPluginSeenPath any
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "first-path-rewriter",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{
+						Path: "/v1/images/generations",
+						Body: []byte(`{"model":"gpt-image-2.5","rewritten":true}`),
+					}, nil
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "second-downstream-observer",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					if req.Metadata != nil {
+						secondPluginSeenPath = req.Metadata[coreexecutor.RequestPathMetadataKey]
+					}
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+	)
+
+	got := host.InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		SourceFormat: "openai-image",
+		Model:        "gpt-image-2.5",
+		Body:         []byte(`{"model":"gpt-image-2.5"}`),
+		Metadata: map[string]any{
+			coreexecutor.RequestPathMetadataKey: "/v1/images/edits",
+		},
+	})
+
+	if got.Path != "/v1/images/generations" {
+		t.Fatalf("got.Path = %q, want /v1/images/generations", got.Path)
+	}
+	if secondPluginSeenPath != "/v1/images/generations" {
+		t.Fatalf("second plugin saw path = %v, want /v1/images/generations", secondPluginSeenPath)
+	}
+}
+
+func TestInterceptorsSkipExceptedPlugin(t *testing.T) {
+	originCalls := 0
+	otherCalls := 0
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "origin",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					originCalls++
+					return pluginapi.RequestInterceptResponse{Body: append(req.Body, []byte("|origin-request")...)}, nil
+				}),
+				ResponseInterceptor: responseInterceptorFunc{
+					interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+						originCalls++
+						return pluginapi.ResponseInterceptResponse{Body: append(req.Body, []byte("|origin-response")...)}, nil
+					},
+				},
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						originCalls++
+						return pluginapi.StreamChunkInterceptResponse{Body: append(req.Body, []byte("|origin-stream")...)}, nil
+					},
+				},
+			}},
+		},
+		capabilityRecord{
+			id:       "other",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					otherCalls++
+					return pluginapi.RequestInterceptResponse{Body: append(req.Body, []byte("|other-request")...)}, nil
+				}),
+				ResponseInterceptor: responseInterceptorFunc{
+					interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+						otherCalls++
+						return pluginapi.ResponseInterceptResponse{Body: append(req.Body, []byte("|other-response")...)}, nil
+					},
+				},
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						otherCalls++
+						return pluginapi.StreamChunkInterceptResponse{Body: append(req.Body, []byte("|other-stream")...)}, nil
+					},
+				},
+			}},
+		},
+	)
+
+	reqOut := host.InterceptRequestBeforeAuthExcept(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("body")}, "origin")
+	afterOut := host.InterceptRequestAfterAuthExcept(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("body")}, "origin")
+	respOut := host.InterceptResponseExcept(context.Background(), pluginapi.ResponseInterceptRequest{Body: []byte("body")}, "origin")
+	streamOut := host.InterceptStreamChunkExcept(context.Background(), pluginapi.StreamChunkInterceptRequest{Body: []byte("body")}, "origin")
+
+	if originCalls != 0 {
+		t.Fatalf("origin plugin calls = %d, want 0", originCalls)
+	}
+	if otherCalls != 4 {
+		t.Fatalf("other plugin calls = %d, want 4", otherCalls)
+	}
+	if string(reqOut.Body) != "body|other-request" {
+		t.Fatalf("request body = %q, want body|other-request", reqOut.Body)
+	}
+	if string(afterOut.Body) != "body|other-request" {
+		t.Fatalf("after-auth request body = %q, want body|other-request", afterOut.Body)
+	}
+	if string(respOut.Body) != "body|other-response" {
+		t.Fatalf("response body = %q, want body|other-response", respOut.Body)
+	}
+	if string(streamOut.Body) != "body|other-stream" {
+		t.Fatalf("stream body = %q, want body|other-stream", streamOut.Body)
+	}
+}
+
+func TestResponseInterceptorsChainAndStreamHistory(t *testing.T) {
+	var seenHistory [][]byte
+	var sawSecondResponse bool
+	var sawSecondStream bool
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "high",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				ResponseInterceptor: responseInterceptorFunc{
+					interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+						return pluginapi.ResponseInterceptResponse{
+							Headers: http.Header{"X-Response": []string{"high"}},
+							Body:    append(req.Body, []byte("|high")...),
+						}, nil
+					},
+				},
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						seenHistory = req.HistoryChunks
+						return pluginapi.StreamChunkInterceptResponse{
+							Headers: http.Header{"X-Stream": []string{"high"}},
+							Body:    append(req.Body, []byte("|high")...),
+						}, nil
+					},
+				},
+			}},
+		},
+		capabilityRecord{
+			id:       "low",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				ResponseInterceptor: responseInterceptorFunc{
+					interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+						if string(req.Body) != "body|high" {
+							t.Fatalf("second response interceptor body = %q, want body|high", req.Body)
+						}
+						if req.ResponseHeaders.Get("X-Response") != "high" {
+							t.Fatalf("second response interceptor headers = %#v, want high header", req.ResponseHeaders)
+						}
+						sawSecondResponse = true
+						return pluginapi.ResponseInterceptResponse{
+							Headers:      http.Header{"X-Response": []string{"low"}, "X-Low": []string{"1"}},
+							ClearHeaders: []string{"X-Remove"},
+							Body:         append(req.Body, []byte("|low")...),
+						}, nil
+					},
+				},
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						if string(req.Body) != "chunk|high" {
+							t.Fatalf("second stream interceptor body = %q, want chunk|high", req.Body)
+						}
+						if req.ResponseHeaders.Get("X-Stream") != "high" {
+							t.Fatalf("second stream interceptor headers = %#v, want high header", req.ResponseHeaders)
+						}
+						if len(req.HistoryChunks) != 1 || string(req.HistoryChunks[0]) != "first" {
+							t.Fatalf("second stream interceptor history = %#v", req.HistoryChunks)
+						}
+						seenHistory = req.HistoryChunks
+						sawSecondStream = true
+						return pluginapi.StreamChunkInterceptResponse{
+							Headers:      http.Header{"X-Stream": []string{"low"}, "X-Low": []string{"1"}},
+							ClearHeaders: []string{"X-Remove"},
+							Body:         append(req.Body, []byte("|low")...),
+						}, nil
+					},
+				},
+			}},
+		},
+	)
+
+	nonStream := host.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{
+		SourceFormat:    "openai",
+		Model:           "normalized",
+		RequestedModel:  "requested",
+		ResponseHeaders: http.Header{"Content-Type": []string{"application/json"}, "X-Remove": []string{"yes"}},
+		Body:            []byte("body"),
+		StatusCode:      http.StatusOK,
+	})
+	if string(nonStream.Body) != "body|high|low" || nonStream.Headers.Get("X-Response") != "low" || nonStream.Headers.Get("X-Low") != "1" {
+		t.Fatalf("non-stream result = %#v", nonStream)
+	}
+	if nonStream.Headers.Get("X-Remove") != "" {
+		t.Fatalf("non-stream headers kept cleared value: %#v", nonStream.Headers)
+	}
+	if !sawSecondResponse {
+		t.Fatal("second response interceptor was not called")
+	}
+
+	stream := host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		SourceFormat:    "openai",
+		Model:           "normalized",
+		RequestedModel:  "requested",
+		ResponseHeaders: http.Header{"Content-Type": []string{"text/event-stream"}, "X-Remove": []string{"yes"}},
+		Body:            []byte("chunk"),
+		HistoryChunks:   [][]byte{[]byte("first")},
+		ChunkIndex:      1,
+	})
+	if string(stream.Body) != "chunk|high|low" || stream.Headers.Get("X-Stream") != "low" || stream.Headers.Get("X-Low") != "1" {
+		t.Fatalf("stream result = %#v", stream)
+	}
+	if stream.Headers.Get("X-Remove") != "" {
+		t.Fatalf("stream headers kept cleared value: %#v", stream.Headers)
+	}
+	if len(seenHistory) != 1 || string(seenHistory[0]) != "first" {
+		t.Fatalf("history = %#v", seenHistory)
+	}
+	if !sawSecondStream {
+		t.Fatal("second stream interceptor was not called")
+	}
+}
+
+func TestInterceptorsSkipErrorsAndFusePanics(t *testing.T) {
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "error",
+			priority: 30,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{}, fmt.Errorf("request failed")
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "panic",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					panic("request panic")
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "success",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{Body: append(req.Body, []byte("|success")...)}, nil
+				}),
+			}},
+		},
+	)
+
+	got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("body")})
+	if string(got.Body) != "body|success" {
+		t.Fatalf("body = %q, want body|success", got.Body)
+	}
+	if !host.isPluginFused("panic") {
+		t.Fatal("panic plugin was not fused")
+	}
+}
+
+func TestStreamInterceptorsDropChunkStopsChain(t *testing.T) {
+	var lowCalled bool
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "high",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						return pluginapi.StreamChunkInterceptResponse{
+							Headers:      http.Header{"X-Stream": []string{"high"}},
+							Body:         append(req.Body, []byte("|high")...),
+							DropChunk:    true,
+							ClearHeaders: nil,
+						}, nil
+					},
+				},
+			}},
+		},
+		capabilityRecord{
+			id:       "low",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						lowCalled = true
+						return pluginapi.StreamChunkInterceptResponse{
+							Headers: http.Header{"X-Stream": []string{"low"}},
+							Body:    append(req.Body, []byte("|low")...),
+						}, nil
+					},
+				},
+			}},
+		},
+	)
+
+	got := host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		SourceFormat:   "openai",
+		Model:          "normalized",
+		RequestedModel: "requested",
+		Body:           []byte("chunk"),
+	})
+	if lowCalled {
+		t.Fatal("low-priority stream interceptor should not be called after DropChunk")
+	}
+	if !got.DropChunk {
+		t.Fatal("DropChunk = false, want true")
+	}
+	if string(got.Body) != "chunk|high" {
+		t.Fatalf("body = %q, want chunk|high", got.Body)
+	}
+	if got.Headers.Get("X-Stream") != "high" {
+		t.Fatalf("headers = %#v, want high header", got.Headers)
+	}
+}
+
+func TestHasStreamInterceptorsReflectsActiveStreamInterceptors(t *testing.T) {
+	requestOnly := newHostWithRecords(capabilityRecord{
+		id: "request",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				return pluginapi.RequestInterceptResponse{Body: req.Body}, nil
+			}),
+		}},
+	})
+	if requestOnly.HasStreamInterceptors() {
+		t.Fatal("HasStreamInterceptors() = true, want false for request-only plugins")
+	}
+
+	responseOnly := newHostWithRecords(capabilityRecord{
+		id: "response",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			ResponseInterceptor: responseInterceptorFunc{
+				interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+					return pluginapi.ResponseInterceptResponse{Body: req.Body}, nil
+				},
+			},
+		}},
+	})
+	if responseOnly.HasStreamInterceptors() {
+		t.Fatal("HasStreamInterceptors() = true, want false for response-only plugins")
+	}
+
+	streamHost := newHostWithRecords(capabilityRecord{
+		id: "stream",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			StreamChunkInterceptor: responseInterceptorFunc{
+				interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+					return pluginapi.StreamChunkInterceptResponse{Body: req.Body}, nil
+				},
+			},
+		}},
+	})
+	if !streamHost.HasStreamInterceptors() {
+		t.Fatal("HasStreamInterceptors() = false, want true for stream interceptors")
+	}
+	streamHost.mu.Lock()
+	streamHost.fused["stream"] = "test fused"
+	streamHost.mu.Unlock()
+	if streamHost.HasStreamInterceptors() {
+		t.Fatal("HasStreamInterceptors() = true, want false after interceptor plugin is fused")
+	}
+}
+
+func TestStreamChunkRequestBodyPolicyBySchemaVersion(t *testing.T) {
+	var legacyGot, modernGot pluginapi.StreamChunkInterceptRequest
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "legacy",
+			plugin: pluginapi.Plugin{
+				SchemaVersion: 2,
+				Capabilities: pluginapi.Capabilities{
+					StreamChunkInterceptor: responseInterceptorFunc{
+						interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+							legacyGot = req
+							return pluginapi.StreamChunkInterceptResponse{Body: req.Body}, nil
+						},
+					},
+				},
+			},
+		},
+		capabilityRecord{
+			id: "modern",
+			plugin: pluginapi.Plugin{
+				SchemaVersion: pluginabi.SchemaVersionStreamChunkOmitRequestBody,
+				Capabilities: pluginapi.Capabilities{
+					StreamChunkInterceptor: responseInterceptorFunc{
+						interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+							modernGot = req
+							return pluginapi.StreamChunkInterceptResponse{Body: req.Body}, nil
+						},
+					},
+				},
+			},
+		},
+	)
+	if !host.StreamChunkPayloadIncludesRequestBody() {
+		t.Fatal("StreamChunkPayloadIncludesRequestBody() = false, want true when legacy stream interceptor is active")
+	}
+
+	_ = host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		OriginalRequest: []byte("original"),
+		RequestBody:     []byte("request"),
+		Body:            []byte("chunk"),
+		ChunkIndex:      0,
+	})
+	if string(legacyGot.OriginalRequest) != "original" || string(legacyGot.RequestBody) != "request" {
+		t.Fatalf("legacy payload bodies = original:%q body:%q, want preserved", legacyGot.OriginalRequest, legacyGot.RequestBody)
+	}
+	if len(modernGot.OriginalRequest) != 0 || len(modernGot.RequestBody) != 0 {
+		t.Fatalf("modern payload bodies = original:%q body:%q, want omitted", modernGot.OriginalRequest, modernGot.RequestBody)
+	}
+
+	legacyGot = pluginapi.StreamChunkInterceptRequest{}
+	modernGot = pluginapi.StreamChunkInterceptRequest{}
+	_ = host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		OriginalRequest: []byte("original"),
+		RequestBody:     []byte("request"),
+		ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
+	})
+	if string(legacyGot.OriginalRequest) != "original" || string(modernGot.OriginalRequest) != "original" {
+		t.Fatalf("header-init bodies not preserved: legacy=%q modern=%q", legacyGot.OriginalRequest, modernGot.OriginalRequest)
+	}
+
+	modernOnly := newHostWithRecords(capabilityRecord{
+		id: "modern-only",
+		plugin: pluginapi.Plugin{
+			SchemaVersion: pluginabi.SchemaVersionStreamChunkOmitRequestBody,
+			Capabilities: pluginapi.Capabilities{
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						return pluginapi.StreamChunkInterceptResponse{}, nil
+					},
+				},
+			},
+		},
+	})
+	if modernOnly.StreamChunkPayloadIncludesRequestBody() {
+		t.Fatal("StreamChunkPayloadIncludesRequestBody() = true, want false for schema v3+ only")
+	}
+}
+
+func TestStreamChunkHistoryPolicyBySchemaVersion(t *testing.T) {
+	var legacyGot, modernGot pluginapi.StreamChunkInterceptRequest
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "legacy",
+			plugin: pluginapi.Plugin{
+				SchemaVersion: 4,
+				Capabilities: pluginapi.Capabilities{
+					StreamChunkInterceptor: responseInterceptorFunc{
+						interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+							legacyGot = req
+							return pluginapi.StreamChunkInterceptResponse{Body: req.Body}, nil
+						},
+					},
+				},
+			},
+		},
+		capabilityRecord{
+			id: "modern",
+			plugin: pluginapi.Plugin{
+				SchemaVersion: pluginabi.SchemaVersionStreamChunkOmitHistory,
+				Capabilities: pluginapi.Capabilities{
+					StreamChunkInterceptor: responseInterceptorFunc{
+						interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+							modernGot = req
+							return pluginapi.StreamChunkInterceptResponse{Body: req.Body}, nil
+						},
+					},
+				},
+			},
+		},
+	)
+	if !host.StreamChunkPayloadIncludesHistory() {
+		t.Fatal("StreamChunkPayloadIncludesHistory() = false, want true when legacy stream interceptor is active")
+	}
+
+	_ = host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		HistoryChunks: [][]byte{[]byte("first")},
+		Body:          []byte("chunk"),
+		ChunkIndex:    0,
+	})
+	if len(legacyGot.HistoryChunks) != 1 || string(legacyGot.HistoryChunks[0]) != "first" {
+		t.Fatalf("legacy payload history = %#v, want preserved", legacyGot.HistoryChunks)
+	}
+	if len(modernGot.HistoryChunks) != 0 {
+		t.Fatalf("modern payload history = %#v, want omitted", modernGot.HistoryChunks)
+	}
+
+	legacyGot = pluginapi.StreamChunkInterceptRequest{}
+	modernGot = pluginapi.StreamChunkInterceptRequest{}
+	_ = host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+		HistoryChunks: [][]byte{[]byte("first")},
+		Body:          []byte("chunk"),
+		ChunkIndex:    pluginapi.StreamChunkHeaderInitIndex,
+	})
+	if len(legacyGot.HistoryChunks) != 1 || string(legacyGot.HistoryChunks[0]) != "first" {
+		t.Fatalf("legacy init history = %#v, want preserved", legacyGot.HistoryChunks)
+	}
+	if len(modernGot.HistoryChunks) != 1 || string(modernGot.HistoryChunks[0]) != "first" {
+		t.Fatalf("modern init history = %#v, want preserved", modernGot.HistoryChunks)
+	}
+
+	modernOnly := newHostWithRecords(capabilityRecord{
+		id: "modern-only",
+		plugin: pluginapi.Plugin{
+			SchemaVersion: pluginabi.SchemaVersionStreamChunkOmitHistory,
+			Capabilities: pluginapi.Capabilities{
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						return pluginapi.StreamChunkInterceptResponse{}, nil
+					},
+				},
+			},
+		},
+	})
+	if modernOnly.StreamChunkPayloadIncludesHistory() {
+		t.Fatal("StreamChunkPayloadIncludesHistory() = true, want false for schema v5+ only")
+	}
+}
+
+func TestHasRequestInterceptorsReflectsActiveRequestInterceptors(t *testing.T) {
+	responseOnly := newHostWithRecords(capabilityRecord{
+		id: "response",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			ResponseInterceptor: responseInterceptorFunc{
+				interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+					return pluginapi.ResponseInterceptResponse{Body: req.Body}, nil
+				},
+			},
+		}},
+	})
+	if responseOnly.HasRequestInterceptors() {
+		t.Fatal("HasRequestInterceptors() = true, want false for response-only plugins")
+	}
+
+	requestHost := newHostWithRecords(capabilityRecord{
+		id: "request",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				return pluginapi.RequestInterceptResponse{Body: req.Body}, nil
+			}),
+		}},
+	})
+	if !requestHost.HasRequestInterceptors() {
+		t.Fatal("HasRequestInterceptors() = false, want true for request interceptors")
+	}
+	requestHost.mu.Lock()
+	requestHost.fused["request"] = "test fused"
+	requestHost.mu.Unlock()
+	if requestHost.HasRequestInterceptors() {
+		t.Fatal("HasRequestInterceptors() = true, want false after request plugin is fused")
+	}
+}
+
+func TestInterceptorsDoNotMutateInputs(t *testing.T) {
+	t.Run("request", func(t *testing.T) {
+		headers := http.Header{"X-Request": []string{"input"}}
+		metadata := map[string]any{
+			"nested":    map[string]any{"value": "original"},
+			"items":     []any{map[string]any{"value": "original"}},
+			"strings":   []string{"original"},
+			"bytes":     []byte("original"),
+			"labels":    map[string]string{"name": "original"},
+			"values":    url.Values{"name": []string{"original"}},
+			"mapSlice":  map[string][]string{"name": []string{"original"}},
+			"sliceMap":  []map[string]string{{"name": "original"}},
+			"aliasMap":  stringSliceAlias{"original"},
+			"aliasList": mapSliceAlias{{"name": "original"}},
+			"key":       "value",
+		}
+		body := []byte("request-body")
+		host := newHostWithRecords(capabilityRecord{
+			id: "request",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					req.Headers.Set("X-Request", "mutated")
+					req.Body[0] = 'R'
+					req.Metadata["key"] = "mutated"
+					req.Metadata["nested"].(map[string]any)["value"] = "mutated"
+					req.Metadata["items"].([]any)[0].(map[string]any)["value"] = "mutated"
+					req.Metadata["strings"].([]string)[0] = "mutated"
+					req.Metadata["bytes"].([]byte)[0] = 'M'
+					req.Metadata["labels"].(map[string]string)["name"] = "mutated"
+					req.Metadata["values"].(url.Values)["name"][0] = "mutated"
+					req.Metadata["mapSlice"].(map[string][]string)["name"][0] = "mutated"
+					req.Metadata["sliceMap"].([]map[string]string)[0]["name"] = "mutated"
+					req.Metadata["aliasMap"].(stringSliceAlias)[0] = "mutated"
+					req.Metadata["aliasList"].(mapSliceAlias)[0]["name"] = "mutated"
+					return pluginapi.RequestInterceptResponse{Body: append(req.Body, []byte("|ok")...)}, nil
+				}),
+			}},
+		})
+
+		got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+			Headers:  headers,
+			Body:     body,
+			Metadata: metadata,
+		})
+		if headers.Get("X-Request") != "input" {
+			t.Fatalf("request headers mutated: %#v", headers)
+		}
+		if string(body) != "request-body" {
+			t.Fatalf("request body mutated: %q", body)
+		}
+		if metadata["key"] != "value" {
+			t.Fatalf("request metadata mutated: %#v", metadata)
+		}
+		if metadata["nested"].(map[string]any)["value"] != "original" || metadata["items"].([]any)[0].(map[string]any)["value"] != "original" {
+			t.Fatalf("request nested metadata mutated: %#v", metadata)
+		}
+		if metadata["strings"].([]string)[0] != "original" || string(metadata["bytes"].([]byte)) != "original" || metadata["labels"].(map[string]string)["name"] != "original" {
+			t.Fatalf("request nested metadata aliases mutated: %#v", metadata)
+		}
+		if metadata["values"].(url.Values)["name"][0] != "original" || metadata["mapSlice"].(map[string][]string)["name"][0] != "original" {
+			t.Fatalf("request map/slice metadata mutated: %#v", metadata)
+		}
+		if metadata["sliceMap"].([]map[string]string)[0]["name"] != "original" || metadata["aliasMap"].(stringSliceAlias)[0] != "original" || metadata["aliasList"].(mapSliceAlias)[0]["name"] != "original" {
+			t.Fatalf("request alias metadata mutated: %#v", metadata)
+		}
+		if !strings.HasSuffix(string(got.Body), "|ok") {
+			t.Fatalf("request result body = %q", got.Body)
+		}
+	})
+
+	t.Run("response", func(t *testing.T) {
+		requestHeaders := http.Header{"X-Request": []string{"input"}}
+		responseHeaders := http.Header{"X-Response": []string{"input"}}
+		originalRequest := []byte("original")
+		requestBody := []byte("request")
+		body := []byte("body")
+		metadata := map[string]any{
+			"nested":    map[string]any{"value": "original"},
+			"items":     []any{map[string]any{"value": "original"}},
+			"strings":   []string{"original"},
+			"bytes":     []byte("original"),
+			"labels":    map[string]string{"name": "original"},
+			"values":    url.Values{"name": []string{"original"}},
+			"mapSlice":  map[string][]string{"name": []string{"original"}},
+			"sliceMap":  []map[string]string{{"name": "original"}},
+			"aliasMap":  stringSliceAlias{"original"},
+			"aliasList": mapSliceAlias{{"name": "original"}},
+			"key":       "value",
+		}
+		host := newHostWithRecords(capabilityRecord{
+			id: "response",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				ResponseInterceptor: responseInterceptorFunc{
+					interceptResponse: func(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
+						req.RequestHeaders.Set("X-Request", "mutated")
+						req.ResponseHeaders.Set("X-Response", "mutated")
+						req.OriginalRequest[0] = 'O'
+						req.RequestBody[0] = 'R'
+						req.Body[0] = 'B'
+						req.Metadata["key"] = "mutated"
+						req.Metadata["nested"].(map[string]any)["value"] = "mutated"
+						req.Metadata["items"].([]any)[0].(map[string]any)["value"] = "mutated"
+						req.Metadata["strings"].([]string)[0] = "mutated"
+						req.Metadata["bytes"].([]byte)[0] = 'M'
+						req.Metadata["labels"].(map[string]string)["name"] = "mutated"
+						req.Metadata["values"].(url.Values)["name"][0] = "mutated"
+						req.Metadata["mapSlice"].(map[string][]string)["name"][0] = "mutated"
+						req.Metadata["sliceMap"].([]map[string]string)[0]["name"] = "mutated"
+						req.Metadata["aliasMap"].(stringSliceAlias)[0] = "mutated"
+						req.Metadata["aliasList"].(mapSliceAlias)[0]["name"] = "mutated"
+						return pluginapi.ResponseInterceptResponse{Body: append(req.Body, []byte("|ok")...)}, nil
+					},
+				},
+			}},
+		})
+
+		got := host.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{
+			RequestHeaders:  requestHeaders,
+			ResponseHeaders: responseHeaders,
+			OriginalRequest: originalRequest,
+			RequestBody:     requestBody,
+			Body:            body,
+			Metadata:        metadata,
+		})
+		if requestHeaders.Get("X-Request") != "input" {
+			t.Fatalf("request headers mutated: %#v", requestHeaders)
+		}
+		if responseHeaders.Get("X-Response") != "input" {
+			t.Fatalf("response headers mutated: %#v", responseHeaders)
+		}
+		if string(originalRequest) != "original" {
+			t.Fatalf("original request mutated: %q", originalRequest)
+		}
+		if string(requestBody) != "request" {
+			t.Fatalf("request body mutated: %q", requestBody)
+		}
+		if string(body) != "body" {
+			t.Fatalf("response body mutated: %q", body)
+		}
+		if metadata["key"] != "value" {
+			t.Fatalf("response metadata mutated: %#v", metadata)
+		}
+		if metadata["nested"].(map[string]any)["value"] != "original" || metadata["items"].([]any)[0].(map[string]any)["value"] != "original" {
+			t.Fatalf("response nested metadata mutated: %#v", metadata)
+		}
+		if metadata["strings"].([]string)[0] != "original" || string(metadata["bytes"].([]byte)) != "original" || metadata["labels"].(map[string]string)["name"] != "original" {
+			t.Fatalf("response nested metadata aliases mutated: %#v", metadata)
+		}
+		if metadata["values"].(url.Values)["name"][0] != "original" || metadata["mapSlice"].(map[string][]string)["name"][0] != "original" {
+			t.Fatalf("response map/slice metadata mutated: %#v", metadata)
+		}
+		if metadata["sliceMap"].([]map[string]string)[0]["name"] != "original" || metadata["aliasMap"].(stringSliceAlias)[0] != "original" || metadata["aliasList"].(mapSliceAlias)[0]["name"] != "original" {
+			t.Fatalf("response alias metadata mutated: %#v", metadata)
+		}
+		if !strings.HasSuffix(string(got.Body), "|ok") {
+			t.Fatalf("response result body = %q", got.Body)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		requestHeaders := http.Header{"X-Request": []string{"input"}}
+		responseHeaders := http.Header{"X-Response": []string{"input"}}
+		originalRequest := []byte("original")
+		requestBody := []byte("request")
+		body := []byte("chunk")
+		history := [][]byte{[]byte("first")}
+		metadata := map[string]any{
+			"nested":    map[string]any{"value": "original"},
+			"items":     []any{map[string]any{"value": "original"}},
+			"strings":   []string{"original"},
+			"bytes":     []byte("original"),
+			"labels":    map[string]string{"name": "original"},
+			"values":    url.Values{"name": []string{"original"}},
+			"mapSlice":  map[string][]string{"name": []string{"original"}},
+			"sliceMap":  []map[string]string{{"name": "original"}},
+			"aliasMap":  stringSliceAlias{"original"},
+			"aliasList": mapSliceAlias{{"name": "original"}},
+			"key":       "value",
+		}
+		host := newHostWithRecords(capabilityRecord{
+			id: "stream",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				StreamChunkInterceptor: responseInterceptorFunc{
+					interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
+						req.RequestHeaders.Set("X-Request", "mutated")
+						req.ResponseHeaders.Set("X-Response", "mutated")
+						req.OriginalRequest[0] = 'O'
+						req.RequestBody[0] = 'R'
+						req.Body[0] = 'C'
+						req.HistoryChunks[0][0] = 'F'
+						req.Metadata["key"] = "mutated"
+						req.Metadata["nested"].(map[string]any)["value"] = "mutated"
+						req.Metadata["items"].([]any)[0].(map[string]any)["value"] = "mutated"
+						req.Metadata["strings"].([]string)[0] = "mutated"
+						req.Metadata["bytes"].([]byte)[0] = 'M'
+						req.Metadata["labels"].(map[string]string)["name"] = "mutated"
+						req.Metadata["values"].(url.Values)["name"][0] = "mutated"
+						req.Metadata["mapSlice"].(map[string][]string)["name"][0] = "mutated"
+						req.Metadata["sliceMap"].([]map[string]string)[0]["name"] = "mutated"
+						req.Metadata["aliasMap"].(stringSliceAlias)[0] = "mutated"
+						req.Metadata["aliasList"].(mapSliceAlias)[0]["name"] = "mutated"
+						return pluginapi.StreamChunkInterceptResponse{Body: append(req.Body, []byte("|ok")...)}, nil
+					},
+				},
+			}},
+		})
+
+		got := host.InterceptStreamChunk(context.Background(), pluginapi.StreamChunkInterceptRequest{
+			RequestHeaders:  requestHeaders,
+			ResponseHeaders: responseHeaders,
+			OriginalRequest: originalRequest,
+			RequestBody:     requestBody,
+			Body:            body,
+			HistoryChunks:   history,
+			Metadata:        metadata,
+		})
+		if requestHeaders.Get("X-Request") != "input" {
+			t.Fatalf("request headers mutated: %#v", requestHeaders)
+		}
+		if responseHeaders.Get("X-Response") != "input" {
+			t.Fatalf("response headers mutated: %#v", responseHeaders)
+		}
+		if string(originalRequest) != "original" {
+			t.Fatalf("original request mutated: %q", originalRequest)
+		}
+		if string(requestBody) != "request" {
+			t.Fatalf("request body mutated: %q", requestBody)
+		}
+		if string(body) != "chunk" {
+			t.Fatalf("stream body mutated: %q", body)
+		}
+		if string(history[0]) != "first" {
+			t.Fatalf("history mutated: %#v", history)
+		}
+		if metadata["key"] != "value" {
+			t.Fatalf("stream metadata mutated: %#v", metadata)
+		}
+		if metadata["nested"].(map[string]any)["value"] != "original" || metadata["items"].([]any)[0].(map[string]any)["value"] != "original" {
+			t.Fatalf("stream nested metadata mutated: %#v", metadata)
+		}
+		if metadata["strings"].([]string)[0] != "original" || string(metadata["bytes"].([]byte)) != "original" || metadata["labels"].(map[string]string)["name"] != "original" {
+			t.Fatalf("stream nested metadata aliases mutated: %#v", metadata)
+		}
+		if metadata["values"].(url.Values)["name"][0] != "original" || metadata["mapSlice"].(map[string][]string)["name"][0] != "original" {
+			t.Fatalf("stream map/slice metadata mutated: %#v", metadata)
+		}
+		if metadata["sliceMap"].([]map[string]string)[0]["name"] != "original" || metadata["aliasMap"].(stringSliceAlias)[0] != "original" || metadata["aliasList"].(mapSliceAlias)[0]["name"] != "original" {
+			t.Fatalf("stream alias metadata mutated: %#v", metadata)
+		}
+		if !strings.HasSuffix(string(got.Body), "|ok") {
+			t.Fatalf("stream result body = %q", got.Body)
+		}
+	})
+
+	t.Run("pointers-and-cycle", func(t *testing.T) {
+		type pointerMetadata struct {
+			Value string
+			Items []string
+		}
+
+		structValue := &pointerMetadata{Value: "original", Items: []string{"original"}}
+		mapValue := &map[string][]string{"names": []string{"original"}}
+		sliceValue := &[]string{"original"}
+		aliasMapValue := &mapSliceAlias{{"name": "original"}}
+		var ifaceValue any = &pointerMetadata{Value: "original", Items: []string{"original"}}
+		cycle := map[string]any{}
+		cycle["self"] = cycle
+
+		metadata := map[string]any{
+			"struct_ptr": structValue,
+			"map_ptr":    mapValue,
+			"slice_ptr":  sliceValue,
+			"alias_ptr":  aliasMapValue,
+			"iface_ptr":  ifaceValue,
+			"cycle":      cycle,
+		}
+
+		host := newHostWithRecords(capabilityRecord{
+			id: "pointer",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					req.Metadata["struct_ptr"].(*pointerMetadata).Value = "mutated"
+					req.Metadata["struct_ptr"].(*pointerMetadata).Items[0] = "mutated"
+					(*req.Metadata["map_ptr"].(*map[string][]string))["names"][0] = "mutated"
+					(*req.Metadata["slice_ptr"].(*[]string))[0] = "mutated"
+					(*req.Metadata["alias_ptr"].(*mapSliceAlias))[0]["name"] = "mutated"
+					req.Metadata["iface_ptr"].(*pointerMetadata).Value = "mutated"
+					if clonedCycle, ok := req.Metadata["cycle"].(map[string]any); ok {
+						clonedCycle["marker"] = "mutated"
+						clonedCycle["self"] = "mutated"
+					}
+					return pluginapi.RequestInterceptResponse{Body: []byte("ok")}, nil
+				}),
+			}},
+		})
+
+		_ = host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Metadata: metadata})
+
+		if structValue.Value != "original" || structValue.Items[0] != "original" {
+			t.Fatalf("struct pointer metadata mutated: %#v", structValue)
+		}
+		if (*mapValue)["names"][0] != "original" {
+			t.Fatalf("map pointer metadata mutated: %#v", mapValue)
+		}
+		if (*sliceValue)[0] != "original" {
+			t.Fatalf("slice pointer metadata mutated: %#v", sliceValue)
+		}
+		if (*aliasMapValue)[0]["name"] != "original" {
+			t.Fatalf("alias pointer metadata mutated: %#v", aliasMapValue)
+		}
+		if ifaceStruct, ok := ifaceValue.(*pointerMetadata); !ok || ifaceStruct.Value != "original" || ifaceStruct.Items[0] != "original" {
+			t.Fatalf("interface pointer metadata mutated: %#v", ifaceValue)
+		}
+		if _, ok := cycle["self"].(map[string]any); !ok {
+			t.Fatalf("cycle metadata structure changed unexpectedly: %#v", cycle)
+		}
+		if _, ok := cycle["marker"]; ok {
+			t.Fatalf("cycle metadata mutated: %#v", cycle)
+		}
+	})
 }
 
 func TestResponseHooksKeepPayloadOrTryNextOnErrorAndEmptyBody(t *testing.T) {
@@ -1345,6 +2388,213 @@ func TestUsageAdapterPanicFusesPlugin(t *testing.T) {
 	}
 }
 
+func TestUsageAdapterNormalizesOmittedGenerateToTrue(t *testing.T) {
+	var gotGenerate bool
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		gotGenerate = record.Generate
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-generate",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-generate",
+	}
+
+	// Legacy callers construct usage.Record without Generate; adapter must publish true.
+	adapter.HandleUsage(context.Background(), coreusage.Record{Provider: "provider", Model: "gpt-5.4"})
+	if !gotGenerate {
+		t.Fatalf("plugin Generate = %v, want true for omitted field", gotGenerate)
+	}
+}
+
+func TestUsageAdapterPropagatesBaseURL(t *testing.T) {
+	var gotBaseURL string
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		gotBaseURL = record.BaseURL
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-base-url",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-base-url",
+	}
+
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "provider",
+		Model:    "gpt-5.4",
+		BaseURL:  "https://custom-proxy.example.com/v1",
+	})
+	if gotBaseURL != "https://custom-proxy.example.com/v1" {
+		t.Fatalf("plugin BaseURL = %q, want https://custom-proxy.example.com/v1", gotBaseURL)
+	}
+}
+
+func TestUsageAdapterPropagatesResponseModelServiceTierAndStream(t *testing.T) {
+	var gotRecord pluginapi.UsageRecord
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		gotRecord = record
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-response-fields",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-response-fields",
+	}
+
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider:            "provider",
+		Model:               "gpt-5.4",
+		ResponseModel:       "gpt-5.6-luna",
+		ServiceTier:         "default",
+		ResponseServiceTier: "priority",
+		Stream:              true,
+	})
+	if gotRecord.Model != "gpt-5.4" {
+		t.Fatalf("plugin Model = %q, want gpt-5.4", gotRecord.Model)
+	}
+	if gotRecord.ResponseModel != "gpt-5.6-luna" {
+		t.Fatalf("plugin ResponseModel = %q, want gpt-5.6-luna", gotRecord.ResponseModel)
+	}
+	if gotRecord.ServiceTier != "default" {
+		t.Fatalf("plugin ServiceTier = %q, want default", gotRecord.ServiceTier)
+	}
+	if gotRecord.ResponseServiceTier != "priority" {
+		t.Fatalf("plugin ResponseServiceTier = %q, want priority", gotRecord.ResponseServiceTier)
+	}
+	if !gotRecord.Stream {
+		t.Fatalf("plugin Stream = %v, want true", gotRecord.Stream)
+	}
+
+	// Verify empty fields and Stream=false propagate cleanly without corruption.
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "provider",
+		Model:    "gpt-5.4",
+		Stream:   false,
+	})
+	if gotRecord.Model != "gpt-5.4" {
+		t.Fatalf("plugin Model = %q, want gpt-5.4", gotRecord.Model)
+	}
+	if gotRecord.ResponseModel != "" {
+		t.Fatalf("plugin ResponseModel = %q, want empty", gotRecord.ResponseModel)
+	}
+	if gotRecord.ResponseServiceTier != "" {
+		t.Fatalf("plugin ResponseServiceTier = %q, want empty", gotRecord.ResponseServiceTier)
+	}
+	if gotRecord.Stream {
+		t.Fatalf("plugin Stream = %v, want false", gotRecord.Stream)
+	}
+}
+
+func TestUsageAdapterPropagatesRequestIDAndTraceID(t *testing.T) {
+	var gotRecord pluginapi.UsageRecord
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		gotRecord = record
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-request-trace-id",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	host.RegisterUsagePlugins()
+
+	adapter := &usageAdapter{host: host, pluginID: "usage-request-trace-id", plugin: plugin}
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		RequestID: "b5db448b-3d6d-495c-9c71-f925b68926cb",
+		TraceID:   "00000001",
+		Provider:  "codex",
+		Model:     "gpt-5.6-luna",
+	})
+
+	if gotRecord.RequestID != "b5db448b-3d6d-495c-9c71-f925b68926cb" {
+		t.Fatalf("plugin RequestID = %q, want b5db448b-3d6d-495c-9c71-f925b68926cb", gotRecord.RequestID)
+	}
+	if gotRecord.TraceID != "00000001" {
+		t.Fatalf("plugin TraceID = %q, want 00000001", gotRecord.TraceID)
+	}
+}
+
+func TestUsageAdapterPreservesExplicitGenerateFalse(t *testing.T) {
+	var gotGenerate bool
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		gotGenerate = record.Generate
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-generate-false",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-generate-false",
+	}
+
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "provider",
+		Model:    "gpt-5.4",
+		Generate: coreusage.GenerateFlag(false),
+	})
+	if gotGenerate {
+		t.Fatalf("plugin Generate = %v, want false", gotGenerate)
+	}
+}
+
+func TestUsageAdapterDetachesContext(t *testing.T) {
+	var receivedCtx context.Context
+	plugin := usagePluginFunc(func(ctx context.Context, record pluginapi.UsageRecord) {
+		receivedCtx = ctx
+	})
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-detach",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-detach",
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	adapter.HandleUsage(canceledCtx, coreusage.Record{
+		Provider: "provider",
+		Model:    "gpt-5.4",
+	})
+	if receivedCtx == nil {
+		t.Fatal("plugin did not receive context")
+	}
+	if errCtx := receivedCtx.Err(); errCtx != nil {
+		t.Fatalf("expected detached context without error, got ctx.Err() = %v", errCtx)
+	}
+
+	receivedCtx = nil
+	adapter.HandleUsage(nil, coreusage.Record{
+		Provider: "provider",
+		Model:    "gpt-5.4",
+	})
+	if receivedCtx == nil {
+		t.Fatal("plugin did not receive context for nil input")
+	}
+	if errCtx := receivedCtx.Err(); errCtx != nil {
+		t.Fatalf("expected non-nil context without error for nil input, got ctx.Err() = %v", errCtx)
+	}
+}
+
 func TestUsageManagerRegisterNamedReplacesWithoutDuplicateDispatch(t *testing.T) {
 	manager := coreusage.NewManager(0)
 	defer manager.Stop()
@@ -1396,7 +2646,7 @@ func TestRegisterFrontendAuthProvidersPrunesStaleKeys(t *testing.T) {
 		t.Fatalf("registered providers did not include %q", key)
 	}
 
-	host.snapshot.Store(&Snapshot{enabled: true})
+	setHostSnapshotForTest(host, true)
 	host.RegisterFrontendAuthProviders()
 	if registeredProviderIdentifier(key) {
 		t.Fatalf("registered providers still included stale key %q", key)
@@ -1415,6 +2665,175 @@ func TestRegisterFrontendAuthProvidersIdentifierPanicFusesPlugin(t *testing.T) {
 
 	if !host.isPluginFused("auth-identifier-panic") {
 		t.Fatal("auth-identifier-panic was not fused")
+	}
+}
+
+func TestRegisterFrontendAuthProvidersSelectsHighestPriorityExclusiveProvider(t *testing.T) {
+	lowKey := "plugin:exclusive-low:custom-auth"
+	highKey := "plugin:exclusive-high:custom-auth"
+	normalKey := "plugin:normal-auth:custom-auth"
+	for _, key := range []string{lowKey, highKey, normalKey} {
+		sdkaccess.UnregisterProvider(key)
+		defer sdkaccess.UnregisterProvider(key)
+	}
+	sdkaccess.ClearExclusiveProvider()
+	defer sdkaccess.ClearExclusiveProvider()
+
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "exclusive-low",
+			priority: 1,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider:          frontendAuthProviderFunc{identifier: "custom-auth"},
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+		capabilityRecord{
+			id:       "exclusive-high",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider:          frontendAuthProviderFunc{identifier: "custom-auth"},
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+		capabilityRecord{
+			id:       "normal-auth",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider: frontendAuthProviderFunc{identifier: "custom-auth"},
+			}},
+		},
+	)
+
+	host.RegisterFrontendAuthProviders()
+
+	providers := sdkaccess.RegisteredProviders()
+	if len(providers) != 1 {
+		t.Fatalf("RegisteredProviders() len = %d, want 1", len(providers))
+	}
+	if providers[0].Identifier() != highKey {
+		t.Fatalf("exclusive provider = %q, want %q", providers[0].Identifier(), highKey)
+	}
+}
+
+func TestRegisterFrontendAuthProvidersSelectsExclusiveProviderByPluginIDWhenPriorityTies(t *testing.T) {
+	alphaKey := "plugin:alpha-auth:custom-auth"
+	betaKey := "plugin:beta-auth:custom-auth"
+	for _, key := range []string{alphaKey, betaKey} {
+		sdkaccess.UnregisterProvider(key)
+		defer sdkaccess.UnregisterProvider(key)
+	}
+	sdkaccess.ClearExclusiveProvider()
+	defer sdkaccess.ClearExclusiveProvider()
+
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "beta-auth",
+			priority: 5,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider:          frontendAuthProviderFunc{identifier: "custom-auth"},
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+		capabilityRecord{
+			id:       "alpha-auth",
+			priority: 5,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider:          frontendAuthProviderFunc{identifier: "custom-auth"},
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+	)
+
+	host.RegisterFrontendAuthProviders()
+
+	providers := sdkaccess.RegisteredProviders()
+	if len(providers) != 1 {
+		t.Fatalf("RegisteredProviders() len = %d, want 1", len(providers))
+	}
+	if providers[0].Identifier() != alphaKey {
+		t.Fatalf("exclusive provider = %q, want %q", providers[0].Identifier(), alphaKey)
+	}
+}
+
+func TestRegisterFrontendAuthProvidersClearsExclusiveProviderWhenExclusivePluginRemoved(t *testing.T) {
+	exclusiveKey := "plugin:exclusive-auth:custom-auth"
+	normalKey := "plugin:normal-auth:custom-auth"
+	for _, key := range []string{exclusiveKey, normalKey} {
+		sdkaccess.UnregisterProvider(key)
+		defer sdkaccess.UnregisterProvider(key)
+	}
+	sdkaccess.ClearExclusiveProvider()
+	defer sdkaccess.ClearExclusiveProvider()
+
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "exclusive-auth",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider:          frontendAuthProviderFunc{identifier: "custom-auth"},
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+		capabilityRecord{
+			id: "normal-auth",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider: frontendAuthProviderFunc{identifier: "custom-auth"},
+			}},
+		},
+	)
+
+	host.RegisterFrontendAuthProviders()
+	if got := sdkaccess.RegisteredProviders(); len(got) != 1 || got[0].Identifier() != exclusiveKey {
+		t.Fatalf("exclusive RegisteredProviders() = %#v, want only %q", got, exclusiveKey)
+	}
+
+	setHostSnapshotForTest(host, true, capabilityRecord{
+		id: "normal-auth",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			FrontendAuthProvider: frontendAuthProviderFunc{identifier: "custom-auth"},
+		}},
+	})
+	host.RegisterFrontendAuthProviders()
+
+	providers := sdkaccess.RegisteredProviders()
+	if len(providers) != 1 {
+		t.Fatalf("RegisteredProviders() len = %d, want 1", len(providers))
+	}
+	if providers[0].Identifier() != normalKey {
+		t.Fatalf("restored provider = %q, want %q", providers[0].Identifier(), normalKey)
+	}
+}
+
+func TestRegisterFrontendAuthProvidersIgnoresExclusiveWithoutFrontendAuthProvider(t *testing.T) {
+	normalKey := "plugin:normal-auth:custom-auth"
+	sdkaccess.UnregisterProvider(normalKey)
+	sdkaccess.ClearExclusiveProvider()
+	defer sdkaccess.UnregisterProvider(normalKey)
+	defer sdkaccess.ClearExclusiveProvider()
+
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "exclusive-without-provider",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProviderExclusive: true,
+			}},
+		},
+		capabilityRecord{
+			id: "normal-auth",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				FrontendAuthProvider: frontendAuthProviderFunc{identifier: "custom-auth"},
+			}},
+		},
+	)
+
+	host.RegisterFrontendAuthProviders()
+
+	providers := sdkaccess.RegisteredProviders()
+	if len(providers) != 1 {
+		t.Fatalf("RegisteredProviders() len = %d, want 1", len(providers))
+	}
+	if providers[0].Identifier() != normalKey {
+		t.Fatalf("provider = %q, want %q", providers[0].Identifier(), normalKey)
 	}
 }
 
@@ -1438,12 +2857,12 @@ func TestUsageAdapterUsesCurrentSnapshotCapability(t *testing.T) {
 		pluginID: "usage-active",
 		plugin:   oldPlugin,
 	}
-	host.snapshot.Store(&Snapshot{enabled: true, records: []capabilityRecord{{
+	setHostSnapshotForTest(host, true, capabilityRecord{
 		id: "usage-active",
 		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
 			UsagePlugin: newPlugin,
 		}},
-	}}})
+	})
 
 	adapter.HandleUsage(context.Background(), coreusage.Record{Provider: "provider"})
 
@@ -1473,7 +2892,7 @@ func TestRegisterUsagePluginsStaleAdapterSkipsRemovedCapability(t *testing.T) {
 		pluginID: "usage-active",
 		plugin:   plugin,
 	}
-	host.snapshot.Store(&Snapshot{enabled: true})
+	setHostSnapshotForTest(host, true)
 	adapter.HandleUsage(context.Background(), coreusage.Record{Provider: "provider"})
 
 	if calls != 0 {
@@ -1481,126 +2900,110 @@ func TestRegisterUsagePluginsStaleAdapterSkipsRemovedCapability(t *testing.T) {
 	}
 }
 
-func TestAccessAdapterUnauthenticatedReturnsNotHandled(t *testing.T) {
-	host := New()
-	adapter := &accessAdapter{
-		host:     host,
-		pluginID: "auth-plugin",
-		provider: frontendAuthProviderFunc{
-			identifier: "custom-auth",
-			authenticate: func(ctx context.Context, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
+func TestAccessAdapterAuthenticateFailures(t *testing.T) {
+	tests := []struct {
+		name             string
+		pluginID         string
+		method           string
+		url              string
+		body             io.ReadCloser
+		authenticate     func(*testing.T, pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error)
+		wantCode         sdkaccess.AuthErrorCode
+		wantCalled       bool
+		wantFused        bool
+		wantRestoredBody string
+	}{
+		{
+			name:     "unauthenticated",
+			pluginID: "auth-plugin",
+			method:   http.MethodGet,
+			url:      "http://example.test/v1/models",
+			authenticate: func(t *testing.T, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
 				return pluginapi.FrontendAuthResponse{Authenticated: false}, nil
 			},
+			wantCode:   sdkaccess.AuthErrorCodeNotHandled,
+			wantCalled: true,
 		},
-	}
-	req, errNewRequest := http.NewRequest(http.MethodGet, "http://example.test/v1/models", nil)
-	if errNewRequest != nil {
-		t.Fatalf("NewRequest() error = %v", errNewRequest)
-	}
-
-	result, authErr := adapter.Authenticate(context.Background(), req)
-	if result != nil {
-		t.Fatalf("Authenticate() result = %#v, want nil", result)
-	}
-	if !sdkaccess.IsAuthErrorCode(authErr, sdkaccess.AuthErrorCodeNotHandled) {
-		t.Fatalf("Authenticate() error = %v, want not handled", authErr)
-	}
-}
-
-func TestAccessAdapterPanicFusesAndReturnsNotHandled(t *testing.T) {
-	host := New()
-	adapter := &accessAdapter{
-		host:     host,
-		pluginID: "auth-panic",
-		provider: frontendAuthProviderFunc{
-			identifier: "custom-auth",
-			authenticate: func(ctx context.Context, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
+		{
+			name:     "panic",
+			pluginID: "auth-panic",
+			method:   http.MethodGet,
+			url:      "http://example.test/v1/models",
+			authenticate: func(t *testing.T, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
 				panic("auth panic")
 			},
+			wantCode:   sdkaccess.AuthErrorCodeNotHandled,
+			wantCalled: true,
+			wantFused:  true,
 		},
-	}
-	req, errNewRequest := http.NewRequest(http.MethodGet, "http://example.test/v1/models", nil)
-	if errNewRequest != nil {
-		t.Fatalf("NewRequest() error = %v", errNewRequest)
-	}
-
-	result, authErr := adapter.Authenticate(context.Background(), req)
-	if result != nil {
-		t.Fatalf("Authenticate() result = %#v, want nil", result)
-	}
-	if !sdkaccess.IsAuthErrorCode(authErr, sdkaccess.AuthErrorCodeNotHandled) {
-		t.Fatalf("Authenticate() error = %v, want not handled", authErr)
-	}
-	if !host.isPluginFused("auth-panic") {
-		t.Fatal("auth-panic was not fused")
-	}
-}
-
-func TestAccessAdapterBodyReadFailureReturnsInternalError(t *testing.T) {
-	host := New()
-	called := false
-	adapter := &accessAdapter{
-		host:     host,
-		pluginID: "auth-plugin",
-		provider: frontendAuthProviderFunc{
-			identifier: "custom-auth",
-			authenticate: func(ctx context.Context, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
-				called = true
+		{
+			name:     "body read failure",
+			pluginID: "auth-plugin",
+			method:   http.MethodPost,
+			url:      "http://example.test/v1/chat",
+			body:     failingReadCloser{},
+			authenticate: func(t *testing.T, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
 				return pluginapi.FrontendAuthResponse{Authenticated: true}, nil
 			},
+			wantCode: sdkaccess.AuthErrorCodeInternal,
 		},
-	}
-	req, errNewRequest := http.NewRequest(http.MethodPost, "http://example.test/v1/chat", nil)
-	if errNewRequest != nil {
-		t.Fatalf("NewRequest() error = %v", errNewRequest)
-	}
-	req.Body = failingReadCloser{}
-
-	result, authErr := adapter.Authenticate(context.Background(), req)
-	if result != nil {
-		t.Fatalf("Authenticate() result = %#v, want nil", result)
-	}
-	if !sdkaccess.IsAuthErrorCode(authErr, sdkaccess.AuthErrorCodeInternal) {
-		t.Fatalf("Authenticate() error = %v, want internal auth error", authErr)
-	}
-	if called {
-		t.Fatal("plugin provider was called after body read failure")
-	}
-}
-
-func TestAccessAdapterErrorReturnsNotHandledAndRestoresBody(t *testing.T) {
-	host := New()
-	adapter := &accessAdapter{
-		host:     host,
-		pluginID: "auth-plugin",
-		provider: frontendAuthProviderFunc{
-			identifier: "custom-auth",
-			authenticate: func(ctx context.Context, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
+		{
+			name:     "provider error restores body",
+			pluginID: "auth-plugin",
+			method:   http.MethodPost,
+			url:      "http://example.test/v1/chat?x=1",
+			body:     io.NopCloser(bytes.NewBufferString("request-body")),
+			authenticate: func(t *testing.T, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
 				if string(req.Body) != "request-body" {
 					t.Fatalf("plugin request body = %q, want %q", req.Body, "request-body")
 				}
 				return pluginapi.FrontendAuthResponse{}, fmt.Errorf("not mine")
 			},
+			wantCode:         sdkaccess.AuthErrorCodeNotHandled,
+			wantCalled:       true,
+			wantRestoredBody: "request-body",
 		},
 	}
-	req, errNewRequest := http.NewRequest(http.MethodPost, "http://example.test/v1/chat?x=1", bytes.NewBufferString("request-body"))
-	if errNewRequest != nil {
-		t.Fatalf("NewRequest() error = %v", errNewRequest)
-	}
 
-	result, authErr := adapter.Authenticate(context.Background(), req)
-	if result != nil {
-		t.Fatalf("Authenticate() result = %#v, want nil", result)
-	}
-	if !sdkaccess.IsAuthErrorCode(authErr, sdkaccess.AuthErrorCodeNotHandled) {
-		t.Fatalf("Authenticate() error = %v, want not handled", authErr)
-	}
-	restored, errReadAll := io.ReadAll(req.Body)
-	if errReadAll != nil {
-		t.Fatalf("ReadAll(restored body) error = %v", errReadAll)
-	}
-	if string(restored) != "request-body" {
-		t.Fatalf("restored body = %q, want %q", restored, "request-body")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host := New()
+			called := false
+			adapter := newAccessAdapterForTest(host, tt.pluginID, frontendAuthProviderFunc{
+				identifier: "custom-auth",
+				authenticate: func(ctx context.Context, req pluginapi.FrontendAuthRequest) (pluginapi.FrontendAuthResponse, error) {
+					called = true
+					return tt.authenticate(t, req)
+				},
+			})
+			req, errNewRequest := http.NewRequest(tt.method, tt.url, tt.body)
+			if errNewRequest != nil {
+				t.Fatalf("NewRequest() error = %v", errNewRequest)
+			}
+
+			result, authErr := adapter.Authenticate(context.Background(), req)
+			if result != nil {
+				t.Fatalf("Authenticate() result = %#v, want nil", result)
+			}
+			if !sdkaccess.IsAuthErrorCode(authErr, tt.wantCode) {
+				t.Fatalf("Authenticate() error = %v, want code %s", authErr, tt.wantCode)
+			}
+			if called != tt.wantCalled {
+				t.Fatalf("provider called = %v, want %v", called, tt.wantCalled)
+			}
+			if tt.wantFused && !host.isPluginFused(tt.pluginID) {
+				t.Fatalf("%s was not fused", tt.pluginID)
+			}
+			if tt.wantRestoredBody != "" {
+				restored, errReadAll := io.ReadAll(req.Body)
+				if errReadAll != nil {
+					t.Fatalf("ReadAll(restored body) error = %v", errReadAll)
+				}
+				if string(restored) != tt.wantRestoredBody {
+					t.Fatalf("restored body = %q, want %q", restored, tt.wantRestoredBody)
+				}
+			}
+		})
 	}
 }
 
@@ -1624,19 +3027,24 @@ func TestExecutorAdapterMethods(t *testing.T) {
 			}
 			return pluginapi.AuthRefreshResponse{
 				Auth: pluginapi.AuthData{
-					Metadata: map[string]any{"token": "new"},
+					Metadata:   map[string]any{"token": "new", "priority": float64(0)},
+					Attributes: map[string]string{"priority": "0"},
 				},
 			}, nil
 		},
 	}
-	host := newHostWithRecords(capabilityRecord{
-		id: "auth-plugin",
-		plugin: pluginapi.Plugin{
-			Capabilities: pluginapi.Capabilities{
-				AuthProvider: authProvider,
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin"})
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "auth-plugin",
+			plugin: pluginapi.Plugin{
+				Capabilities: pluginapi.Capabilities{
+					AuthProvider: authProvider,
+				},
 			},
 		},
-	})
+		executorRecord,
+	)
 
 	exec := &fakeExecutor{
 		identifier: "ignored-by-adapter",
@@ -1676,16 +3084,19 @@ func TestExecutorAdapterMethods(t *testing.T) {
 			}, nil
 		},
 	}
-	adapter := &executorAdapter{
-		host:     host,
-		pluginID: "executor-plugin",
-		provider: "plugin-provider",
-		executor: exec,
-	}
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+	)
 	auth := &coreauth.Auth{
 		ID:       "auth-1",
 		Provider: "plugin-provider",
-		Metadata: map[string]any{"old": "value"},
+		Metadata: map[string]any{"old": "value", "priority": float64(1)},
+		Attributes: map[string]string{
+			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+			coreauth.AttributeFilePriority:  "true",
+			"priority":                      "1",
+		},
 	}
 	req := coreexecutor.Request{
 		Model:   "model-1",
@@ -1700,7 +3111,7 @@ func TestExecutorAdapterMethods(t *testing.T) {
 		Alt:             "alt",
 		Headers:         http.Header{"X-Request": []string{"yes"}},
 		OriginalRequest: []byte("original"),
-		SourceFormat:    sdktranslator.FormatClaude,
+		SourceFormat:    sdktranslator.FormatOpenAI,
 		Metadata: map[string]any{
 			"opt": "metadata",
 		},
@@ -1746,6 +3157,9 @@ func TestExecutorAdapterMethods(t *testing.T) {
 	if refreshed.Metadata["token"] != "new" {
 		t.Fatalf("Refresh() metadata = %#v, want token=new", refreshed.Metadata)
 	}
+	if refreshed.Attributes["priority"] != "1" || refreshed.Metadata["priority"] != float64(1) {
+		t.Fatalf("Refresh() priority = %q/%v, want 1/1", refreshed.Attributes["priority"], refreshed.Metadata["priority"])
+	}
 
 	count, errCountTokens := adapter.CountTokens(context.Background(), auth, req, opts)
 	if errCountTokens != nil {
@@ -1790,6 +3204,109 @@ func TestExecutorAdapterMethods(t *testing.T) {
 	}
 	if errNilRequest == nil || !strings.Contains(errNilRequest.Error(), "nil HTTP request") {
 		t.Fatalf("HttpRequest(nil) error = %v, want nil request error", errNilRequest)
+	}
+}
+
+func TestExecutorAdapterUsesResponseFormatForOutputTranslation(t *testing.T) {
+	claudeResponse := []byte(`{"id":"msg_1","type":"message","model":"claude-test","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+	openAIRequest := []byte(`{"model":"model-1","messages":[{"role":"user","content":"hi"}]}`)
+
+	var captured pluginapi.ExecutorRequest
+	host := New()
+	adapter := newCurrentExecutorAdapterForTest(host, "executor-plugin", &fakeExecutor{
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			captured = req
+			return pluginapi.ExecutorResponse{Payload: claudeResponse}, nil
+		},
+	},
+		[]sdktranslator.Format{sdktranslator.FormatClaude},
+		[]sdktranslator.Format{sdktranslator.FormatClaude},
+	)
+
+	resp, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
+		Model:   "model-1",
+		Format:  sdktranslator.FormatOpenAI,
+		Payload: openAIRequest,
+	}, coreexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatClaude,
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if captured.SourceFormat != sdktranslator.FormatClaude.String() {
+		t.Fatalf("executor SourceFormat = %q, want %q", captured.SourceFormat, sdktranslator.FormatClaude)
+	}
+	if captured.Format != sdktranslator.FormatClaude.String() {
+		t.Fatalf("executor Format = %q, want %q", captured.Format, sdktranslator.FormatClaude)
+	}
+	if bytes.Equal(captured.Payload, openAIRequest) || !bytes.Contains(captured.Payload, []byte(`"max_tokens":32000`)) {
+		t.Fatalf("executor payload = %s, want translated Claude request", captured.Payload)
+	}
+	if !bytes.Equal(resp.Payload, claudeResponse) {
+		t.Fatalf("Execute() payload = %s, want Claude response payload %s", resp.Payload, claudeResponse)
+	}
+}
+
+func TestExecutorAdapterSelectsCustomOutputWithHostResponseTranslator(t *testing.T) {
+	customOutputFormat := sdktranslator.Format("plugin-custom-output")
+	requestedFormat := sdktranslator.FormatOpenAI
+	body := []byte("plugin-body")
+	translatedBody := []byte("translated-body")
+	var captured pluginapi.ResponseTransformRequest
+
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin"})
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "response-translator",
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				ResponseTranslator: responseTranslatorFunc(func(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
+					captured = req
+					return pluginapi.PayloadResponse{Body: translatedBody}, nil
+				}),
+			}},
+		},
+		executorRecord,
+	)
+	sdktranslator.SetPluginHooks(host)
+	t.Cleanup(func() {
+		sdktranslator.SetPluginHooks(nil)
+	})
+
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, &fakeExecutor{
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			if req.Format != customOutputFormat.String() {
+				t.Fatalf("executor Format = %q, want %q", req.Format, customOutputFormat)
+			}
+			return pluginapi.ExecutorResponse{Payload: body}, nil
+		},
+	},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{customOutputFormat},
+	)
+
+	resp, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
+		Model:   "model-1",
+		Format:  sdktranslator.FormatOpenAI,
+		Payload: []byte(`{"model":"model-1"}`),
+	}, coreexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: requestedFormat,
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if !bytes.Equal(resp.Payload, translatedBody) {
+		t.Fatalf("Execute() payload = %q, want %q", resp.Payload, translatedBody)
+	}
+	if captured.FromFormat != customOutputFormat.String() || captured.ToFormat != requestedFormat.String() {
+		t.Fatalf("translator formats = %q -> %q, want %q -> %q", captured.FromFormat, captured.ToFormat, customOutputFormat, requestedFormat)
+	}
+	if captured.Stream {
+		t.Fatal("translator Stream = true, want false")
+	}
+	if !bytes.Equal(captured.Body, body) {
+		t.Fatalf("translator body = %q, want %q", captured.Body, body)
 	}
 }
 
@@ -1845,24 +3362,63 @@ func TestExecutorAdapterConsumesTranslatedStreamChunksWithoutOutput(t *testing.T
 	}
 }
 
+func TestExecutorAdapterKeepsRawStreamFallbackWithOnlyHostResponseTranslator(t *testing.T) {
+	customOutputFormat := sdktranslator.Format("plugin-custom-stream-output")
+	requestedFormat := sdktranslator.FormatOpenAI
+	payload := []byte(`{"custom":"chunk"}`)
+	host := newHostWithRecords(capabilityRecord{
+		id: "empty-response-translator",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			ResponseTranslator: responseTranslatorFunc(func(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
+				return pluginapi.PayloadResponse{}, nil
+			}),
+		}},
+	})
+	sdktranslator.SetPluginHooks(host)
+	t.Cleanup(func() {
+		sdktranslator.SetPluginHooks(nil)
+	})
+	adapter := &executorAdapter{
+		host: host,
+	}
+	prepared := preparedExecutorCall{
+		req: coreexecutor.Request{
+			Model:   "model-1",
+			Payload: []byte(`{"model":"model-1"}`),
+		},
+		opts: coreexecutor.Options{
+			OriginalRequest: []byte(`{"model":"model-1","stream":true}`),
+		},
+		requestedFormat: requestedFormat,
+		outputFormat:    customOutputFormat,
+	}
+	var param any
+
+	frames := adapter.translateExecutorStreamPayload(context.Background(), prepared, payload, &param)
+	if len(frames) != 1 {
+		t.Fatalf("translated stream frame count = %d, want 1", len(frames))
+	}
+	if !bytes.Equal(frames[0], payload) {
+		t.Fatalf("translated stream frame = %q, want raw payload %q", frames[0], payload)
+	}
+}
+
 func TestExecutorAdapterPanicFusesAndReturnsError(t *testing.T) {
 	host := New()
 	calls := 0
-	adapter := &executorAdapter{
-		host:     host,
-		pluginID: "executor-panic",
-		provider: "plugin-provider",
-		executor: &fakeExecutor{
-			execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-				calls++
-				panic("execute panic")
-			},
-			countTokens: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-				calls++
-				return pluginapi.ExecutorResponse{Payload: []byte("should-not-run")}, nil
-			},
+	adapter := newCurrentExecutorAdapterForTest(host, "executor-panic", &fakeExecutor{
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			calls++
+			panic("execute panic")
 		},
-	}
+		countTokens: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			calls++
+			return pluginapi.ExecutorResponse{Payload: []byte("should-not-run")}, nil
+		},
+	},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+	)
 
 	resp, errExecute := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{}, coreexecutor.Options{})
 	if errExecute == nil {
@@ -1921,10 +3477,81 @@ func TestMapExecutorStreamChunksExitsWhenContextCanceledWithoutDownstreamConsume
 
 func newHostWithRecords(records ...capabilityRecord) *Host {
 	host := New()
-	sortRecords(records)
-	host.snapshot.Store(&Snapshot{enabled: true, records: records})
+	setHostSnapshotForTest(host, true, records...)
 	return host
 }
+
+func setHostSnapshotForTest(host *Host, enabled bool, records ...capabilityRecord) {
+	records = normalizeTestCapabilityRecords(records)
+	sortRecords(records)
+	host.mu.Lock()
+	host.rebuildActivePluginMapsLocked(records)
+	host.snapshot.Store(&Snapshot{enabled: enabled, records: records, quotaSupportedProviders: make(map[string][]string)})
+	host.mu.Unlock()
+}
+
+func newAccessAdapterForTest(host *Host, pluginID string, provider pluginapi.FrontendAuthProvider) *accessAdapter {
+	record := normalizeTestCapabilityRecord(capabilityRecord{id: pluginID})
+	setHostSnapshotForTest(host, true, record)
+	return &accessAdapter{
+		host:     host,
+		pluginID: pluginID,
+		path:     record.path,
+		version:  record.version,
+		provider: provider,
+	}
+}
+
+func newCurrentExecutorAdapterForTest(host *Host, pluginID string, executor pluginapi.ProviderExecutor, inputFormats, outputFormats []sdktranslator.Format) *executorAdapter {
+	record := normalizeTestCapabilityRecord(capabilityRecord{id: pluginID})
+	setHostSnapshotForTest(host, true, record)
+	return newExecutorAdapterForRecordForTest(host, record, executor, inputFormats, outputFormats)
+}
+
+func newExecutorAdapterForRecordForTest(host *Host, record capabilityRecord, executor pluginapi.ProviderExecutor, inputFormats, outputFormats []sdktranslator.Format) *executorAdapter {
+	record = normalizeTestCapabilityRecord(record)
+	return &executorAdapter{
+		host:          host,
+		pluginID:      record.id,
+		path:          record.path,
+		version:       record.version,
+		provider:      "plugin-provider",
+		executor:      executor,
+		inputFormats:  inputFormats,
+		outputFormats: outputFormats,
+	}
+}
+
+func normalizeTestCapabilityRecord(record capabilityRecord) capabilityRecord {
+	id := strings.TrimSpace(record.id)
+	if id == "" {
+		return record
+	}
+	if strings.TrimSpace(record.path) == "" {
+		record.path = fmt.Sprintf("testdata/%s.plugin", id)
+	}
+	if strings.TrimSpace(record.version) == "" {
+		version := strings.TrimSpace(record.meta.Version)
+		if version == "" {
+			version = "test-version"
+		}
+		record.version = version
+	}
+	return record
+}
+
+func normalizeTestCapabilityRecords(records []capabilityRecord) []capabilityRecord {
+	out := make([]capabilityRecord, len(records))
+	copy(out, records)
+	for i := range out {
+		out[i] = normalizeTestCapabilityRecord(out[i])
+	}
+	return out
+}
+
+type stringSliceAlias []string
+
+type mapSliceAlias []map[string]string
 
 type requestNormalizerFunc func(context.Context, pluginapi.RequestTransformRequest) (pluginapi.PayloadResponse, error)
 
@@ -2216,7 +3843,7 @@ func assertExecutorRequest(t *testing.T, req pluginapi.ExecutorRequest) {
 	t.Helper()
 	if req.AuthID != "auth-1" || req.AuthProvider != "plugin-provider" || req.Model != "model-1" || req.Format != sdktranslator.FormatOpenAI.String() ||
 		!req.Stream || req.Alt != "alt" || req.Headers.Get("X-Request") != "yes" || string(req.OriginalRequest) != "original" ||
-		req.SourceFormat != sdktranslator.FormatClaude.String() || string(req.Payload) != "payload" ||
+		req.SourceFormat != sdktranslator.FormatOpenAI.String() || string(req.Payload) != "payload" ||
 		req.Metadata["req"] != "metadata" || req.Metadata["opt"] != "metadata" {
 		t.Fatalf("executor request = %#v, want mapped request", req)
 	}
@@ -2231,4 +3858,299 @@ func (failingReadCloser) Read(p []byte) (int, error) {
 
 func (failingReadCloser) Close() error {
 	return nil
+}
+
+func TestInterceptRequest_ReadOnlyInterceptorDoesNotReplaceBody_Issue6101(t *testing.T) {
+	// A read-only interceptor (like cpa-account-config-manager) returns an unmodified body (empty/nil Body).
+	// Per RequestInterceptResponse documentation, "Body replaces the current request body only when non-empty."
+	// When an interceptor does not mutate the body, host.InterceptRequestBeforeAuth and InterceptRequestAfterAuth
+	// must return an empty/nil Body so downstream callers know the request body was not replaced,
+	// rather than returning a cloned copy of the input body.
+	host := newHostWithRecords(capabilityRecord{
+		id: "read-only-observer",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				return pluginapi.RequestInterceptResponse{
+					Headers: http.Header{"X-Observed": []string{"true"}},
+				}, nil
+			}),
+		}},
+	})
+
+	inputBody := []byte("large-request-payload-for-codex-session")
+	gotBefore := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		Body: inputBody,
+	})
+	if len(gotBefore.Body) != 0 {
+		t.Fatalf("InterceptRequestBeforeAuth returned non-empty body %q, want empty body for read-only interceptor", gotBefore.Body)
+	}
+	if gotBefore.Headers.Get("X-Observed") != "true" {
+		t.Fatalf("expected header X-Observed to be preserved, got %#v", gotBefore.Headers)
+	}
+
+	gotAfter := host.InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		Body: inputBody,
+	})
+	if len(gotAfter.Body) != 0 {
+		t.Fatalf("InterceptRequestAfterAuth returned non-empty body %q, want empty body for read-only interceptor", gotAfter.Body)
+	}
+}
+
+func TestInterceptRequest_FirstPluginInPlaceMutationDiscardedIfEmptyOrFailed(t *testing.T) {
+	// If plugin 1 mutates req.Body in-place but returns an empty body (or fails),
+	// plugin 2 must still receive the uncorrupted original body from currentBase.
+	var plugin2ReceivedBody []byte
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "plugin-1-mutator",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					// In-place mutation on nextReq.Body
+					req.Body[0] = 'X'
+					// Returns empty body (mutation is not returned as a replacement)
+					return pluginapi.RequestInterceptResponse{
+						Headers: http.Header{"X-Plugin-1": []string{"ran"}},
+					}, nil
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "plugin-2-observer",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					plugin2ReceivedBody = bytes.Clone(req.Body)
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+	)
+
+	inputBody := []byte("clean-payload")
+	got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		Body: inputBody,
+	})
+
+	if string(inputBody) != "clean-payload" {
+		t.Fatalf("caller inputBody was corrupted: %q", string(inputBody))
+	}
+	if string(plugin2ReceivedBody) != "clean-payload" {
+		t.Fatalf("plugin 2 received corrupted body: %q, want clean-payload", string(plugin2ReceivedBody))
+	}
+	if len(got.Body) != 0 {
+		t.Fatalf("got.Body should be empty when no plugin returned non-empty body, got: %q", string(got.Body))
+	}
+}
+
+func TestInterceptRequest_FirstPluginInPlaceMutationDiscardedOnError(t *testing.T) {
+	// If plugin 1 mutates req.Body in-place but returns an error,
+	// plugin 2 must still receive the uncorrupted original body from currentBase.
+	var plugin2ReceivedBody []byte
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "plugin-1-error",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					req.Body[0] = 'E'
+					return pluginapi.RequestInterceptResponse{}, errors.New("interceptor failed")
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "plugin-2-observer",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					plugin2ReceivedBody = bytes.Clone(req.Body)
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+	)
+
+	inputBody := []byte("clean-payload")
+	got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		Body: inputBody,
+	})
+
+	if string(inputBody) != "clean-payload" {
+		t.Fatalf("caller inputBody was corrupted: %q", string(inputBody))
+	}
+	if string(plugin2ReceivedBody) != "clean-payload" {
+		t.Fatalf("plugin 2 received corrupted body: %q, want clean-payload", string(plugin2ReceivedBody))
+	}
+	if len(got.Body) != 0 {
+		t.Fatalf("got.Body should be empty when no plugin returned non-empty body, got: %q", string(got.Body))
+	}
+}
+
+func TestInterceptRequest_FirstPluginInPlaceMutationDiscardedOnPanic(t *testing.T) {
+	var plugin2ReceivedBody []byte
+	host := newHostWithRecords(
+		capabilityRecord{
+			id:       "plugin-1-panic",
+			priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					req.Body[0] = 'Z'
+					panic("boom")
+				}),
+			}},
+		},
+		capabilityRecord{
+			id:       "plugin-2-observer",
+			priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					plugin2ReceivedBody = bytes.Clone(req.Body)
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+	)
+
+	inputBody := []byte("clean-payload")
+	got := host.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{
+		Body: inputBody,
+	})
+
+	if string(inputBody) != "clean-payload" {
+		t.Fatalf("caller inputBody was corrupted: %q", string(inputBody))
+	}
+	if string(plugin2ReceivedBody) != "clean-payload" {
+		t.Fatalf("plugin 2 received corrupted body: %q, want clean-payload", string(plugin2ReceivedBody))
+	}
+	if len(got.Body) != 0 {
+		t.Fatalf("got.Body should be empty when no plugin returned non-empty body, got: %q", string(got.Body))
+	}
+}
+
+func BenchmarkHostRequestInterceptors_ReadOnly(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes int
+	}{
+		{name: "1MiB", bytes: 1 << 20},
+		{name: "8MiB", bytes: 8 << 20},
+	}
+	// 1 read-only plugin (matching cpa-account-config-manager)
+	hostSingle := newHostWithRecords(capabilityRecord{
+		id: "read-only-observer",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+				return pluginapi.RequestInterceptResponse{}, nil
+			}),
+		}},
+	})
+	// 2 read-only plugins
+	hostMulti := newHostWithRecords(
+		capabilityRecord{
+			id: "observer-1", priority: 20,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+		capabilityRecord{
+			id: "observer-2", priority: 10,
+			plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+				RequestInterceptor: requestInterceptorFunc(func(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+					return pluginapi.RequestInterceptResponse{}, nil
+				}),
+			}},
+		},
+	)
+
+	for _, size := range sizes {
+		payload := make([]byte, size.bytes)
+		b.Run("single/"+size.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				got := hostSingle.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: payload})
+				if len(got.Body) != 0 {
+					b.Fatal("expected empty body for read-only interceptor")
+				}
+			}
+		})
+		b.Run("multi/"+size.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				got := hostMulti.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: payload})
+				if len(got.Body) != 0 {
+					b.Fatal("expected empty body for read-only interceptor")
+				}
+			}
+		})
+	}
+}
+
+func TestExecutorAdapterRefresh_MergesAttributesAndPreservesPath_Issue6119(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "plugin.json")
+	authProvider := fakeAuthProvider{
+		identifier: "plugin-provider",
+		refreshAuth: func(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
+			return pluginapi.AuthRefreshResponse{
+				Auth: pluginapi.AuthData{
+					Metadata:   map[string]any{"token": "new"},
+					Attributes: map[string]string{"priority": "2"},
+				},
+			}, nil
+		},
+	}
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin"})
+	host := newHostWithRecords(
+		capabilityRecord{
+			id: "auth-plugin",
+			plugin: pluginapi.Plugin{
+				Capabilities: pluginapi.Capabilities{
+					AuthProvider: authProvider,
+				},
+			},
+		},
+		executorRecord,
+	)
+
+	exec := &fakeExecutor{identifier: "ignored-by-adapter"}
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+	)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-1",
+		Provider: "plugin-provider",
+		FileName: "plugin.json",
+		Attributes: map[string]string{
+			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+			coreauth.AttributePath:          filePath,
+			coreauth.AttributeSource:        filePath,
+			"custom_env":                    "staging",
+		},
+		Metadata: map[string]any{"token": "old"},
+	}
+
+	refreshed, errRefresh := adapter.Refresh(context.Background(), auth)
+	if errRefresh != nil {
+		t.Fatalf("Refresh() error = %v", errRefresh)
+	}
+	if got := refreshed.Attributes[coreauth.AttributePath]; got != filePath {
+		t.Errorf("refreshed path attribute = %q, want %q", got, filePath)
+	}
+	if got := refreshed.Attributes[coreauth.AttributeSource]; got != filePath {
+		t.Errorf("refreshed source attribute = %q, want %q", got, filePath)
+	}
+	if got := refreshed.Attributes[coreauth.AttributeSourceBackend]; got != coreauth.AuthSourceFile {
+		t.Errorf("refreshed source_backend attribute = %q, want %q", got, coreauth.AuthSourceFile)
+	}
+	if got := refreshed.Attributes["custom_env"]; got != "staging" {
+		t.Errorf("refreshed custom_env attribute = %q, want staging", got)
+	}
+	if got := refreshed.Attributes["priority"]; got != "2" {
+		t.Errorf("refreshed priority attribute = %q, want 2", got)
+	}
 }
